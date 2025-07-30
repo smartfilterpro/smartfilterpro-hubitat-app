@@ -42,7 +42,7 @@ def handleThermostatUpdate(evt) {
 
     // Post to Railway
     def railwayParams = [
-        uri: "https://therm-production-455e.up.railway.app/webhook",
+        uri: "smartfilterpro-hubitat-railway-hubitat.up.railway.app/webhook",
         contentType: "application/json",
         body: [
             body: [[
@@ -63,7 +63,7 @@ def handleThermostatUpdate(evt) {
 
     // Post to Bubble
     def bubbleParams = [
-        uri: "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat/initialize",
+        uri: "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat",
         contentType: "application/json",
         body: [
             userId             : userId,
