@@ -70,7 +70,7 @@ def handleThermostatUpdate(evt) {
 
     // Post to Bubble
     def bubbleParams = [
-        uri: "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat/initialize",
+        uri: "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat",
         contentType: "application/json",
         body: [
             userId             : userId,
