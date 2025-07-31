@@ -77,7 +77,8 @@ def handleThermostatUpdate(evt) {
             currentTemperature : temp,
             isActive           : isActive,
             deviceName         : deviceName,
-            vendor             : vendor
+            vendor             : vendor,
+            state              : state
         ]
     ]
 
