@@ -25,6 +25,13 @@ definition(
 )
 
 preferences {
+    section("Thermostat Device") {
+        input "thermostat", "capability.thermostat", title: "Select Thermostat", required: true
+    }
+    section("SmartFilterPro Settings") {
+        input "userId", "text", title: "User ID", required: true
+        input "thermostatId", "text", title: "Thermostat ID", required: true
+    }
     section("Thermostat Tracking Configuration") {
         input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true, description: "Turn on detailed logging for troubleshooting"
         input "maxRuntimeHours", "number", title: "Maximum Runtime Hours", defaultValue: 24, range: "1..168", description: "Maximum runtime before session is considered stale (1-168 hours)"
@@ -33,7 +40,6 @@ preferences {
         input "httpTimeout", "number", title: "HTTP Timeout (seconds)", defaultValue: 30, range: "5..120", description: "Timeout for HTTP requests to Bubble"
         input "enableSessionStats", "bool", title: "Enable Session Statistics", defaultValue: false, description: "Log session statistics periodically"
     }
-    
     section("Advanced Settings") {
         input "resetAllSessions", "bool", title: "Reset All Sessions on Save", defaultValue: false, description: "WARNING: This will clear all active runtime tracking"
         input "enableRetryLogic", "bool", title: "Enable HTTP Retry Logic", defaultValue: true, description: "Retry failed HTTP requests up to 3 times"
@@ -47,6 +53,7 @@ def installed() {
 
 def updated() {
     log.info "🔄 SmartFilterPro Thermostat Bridge Updated"
+    unsubscribe()
     unschedule()
     
     if (resetAllSessions) {
@@ -64,6 +71,10 @@ def initialize() {
         state.sessionTrackingInitialized = true
     }
     
+    // Subscribe to thermostat events
+    subscribe(thermostat, "thermostatOperatingState", handleEvent)
+    subscribe(thermostat, "temperature", handleEvent)
+    
     // Schedule cleanup based on user preference
     scheduleCleanup()
     
@@ -75,7 +86,13 @@ def initialize() {
     log.info "✅ SmartFilterPro Thermostat Bridge Initialized"
 }
 
-def sendThermostatData(thermostat, userId, deviceId, thermostatId, tempF, isActive, deviceName, mode, scale) {
+def handleEvent(evt) {
+    def deviceId = thermostat.getId()
+    def deviceName = thermostat.displayName
+    def tempF = thermostat.currentTemperature
+    def mode = thermostat.currentThermostatMode
+    def isActive = thermostat.currentThermostatOperatingState in ["heating", "cooling", "fan only"]
+    def scale = location.temperatureScale
     def vendor = thermostat.getDataValue("manufacturer")
     def timestamp = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
     def maxRuntimeSeconds = (maxRuntimeHours ?: 24) * 3600
@@ -139,7 +156,6 @@ def sendThermostatData(thermostat, userId, deviceId, thermostatId, tempF, isActi
     // Update the previous state for next comparison
     state[wasActiveKey] = isActive
 
-    // Prepare payload
     def bubblePayload = [
         userId            : userId,
         thermostatId      : thermostatId,
