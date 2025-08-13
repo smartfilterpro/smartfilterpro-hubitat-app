@@ -19,7 +19,8 @@ Go to `Apps Code` in your Hubitat admin panel.
 
 Click the green **Add app** button:
 
-![Add app code]([https://github.com/smartfilterpro/smartfilterpro-hubitat-app/assets/your-upload-id/05251c3e-a035-40cc-be6c-d65bfe898a14.png](https://private-user-images.githubusercontent.com/219031072/477352103-ca66560f-8693-4ac1-b0a6-445c45837bac.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTUwNTY4NDgsIm5iZiI6MTc1NTA1NjU0OCwicGF0aCI6Ii8yMTkwMzEwNzIvNDc3MzUyMTAzLWNhNjY1NjBmLTg2OTMtNGFjMS1iMGE2LTQ0NWM0NTgzN2JhYy5wbmc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBVkNPRFlMU0E1M1BRSzRaQSUyRjIwMjUwODEzJTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MDgxM1QwMzQyMjhaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT1hMTNmNWM4NDAzZGYxZjg1N2ZlYjkxYjhhYjg3MWQ4NDViNzU3NWNiYjhjNzNmYjE4YTk4YWRmOGVmYzZiZjA5JlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCJ9.L5EF1J0sfGoE4YMAogQU6bOQ259_YnRwD4SuETxKfe8))
+<img width="2452" height="1312" alt="image" src="https://github.com/user-attachments/assets/5c2b14e6-ad87-4acc-9b2a-8b6412c26094" />
+
 
 Paste the [Groovy app code](https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/refs/heads/main/SmartFilterProHubitatApp.groovy) into the editor and click **Save**.
 
