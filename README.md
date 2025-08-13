@@ -34,7 +34,8 @@ Go to `Apps` → `+ Add User App` → Select **SmartFilterPro Thermostat Bridge*
 
 You'll be prompted to configure the app:
 
-![App config screen](https://github.com/smartfilterpro/smartfilterpro-hubitat-app/assets/your-upload-id/125cb7bf-5409-4251-914f-39b6231592dd.png)
+<img width="2460" height="1312" alt="image" src="https://github.com/user-attachments/assets/b502f6f0-0014-4af6-bca5-c67944b9ad95" />
+
 
 Required fields:
 - **Select Thermostat**: Choose your Hubitat-connected thermostat
@@ -54,7 +55,8 @@ If you’re using the **Ecobee Integration**, you may need to reduce its poll ra
 
 Update the polling interval to **1 minute**:
 
-![Ecobee integration](https://github.com/smartfilterpro/smartfilterpro-hubitat-app/assets/your-upload-id/67dd2d0e-a0e5-4330-8ad1-a7ea8d7a0b75.png)
+<img width="2455" height="1317" alt="image" src="https://github.com/user-attachments/assets/3e90f0dc-6bb0-4dbe-8432-7d49e1da4123" />
+
 
 > ⚠️ Lower polling intervals may lead to rate limits from Ecobee’s API.
 
