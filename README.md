@@ -55,7 +55,8 @@ If you’re using the **Ecobee Integration**, you may need to reduce its poll ra
 
 Update the polling interval to **1 minute**:
 
-<img width="2455" height="1317" alt="image" src="https://github.com/user-attachments/assets/3e90f0dc-6bb0-4dbe-8432-7d49e1da4123" />
+<img width="1228" height="659" alt="image" src="https://github.com/user-attachments/assets/75a7c71f-0c79-4701-be60-a9d6c85a0f73" />
+
 
 
 > ⚠️ Lower polling intervals may lead to rate limits from Ecobee’s API.
