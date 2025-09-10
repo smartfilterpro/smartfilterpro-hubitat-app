@@ -31,7 +31,7 @@ import groovy.transform.Field
 /* ============================== METADATA ============================== */
 
 definition (
-    name: "SmartFilterPro Thermostat Bridge (Polling Test)",
+    name: "SmartFilterPro Thermostat Bridge",
     namespace: "smartfilterpro",
     author: "Eric Hanfman",
     description: "Sends thermostat state & runtime to SmartFilterPro (Bubble) and polls status.",
