@@ -1,13 +1,12 @@
 /**
  *  SmartFilterPro Thermostat Bridge (Hubitat)
  *  - Link with email/password → Bubble returns access_token/refresh_token/user_id/hvac(s)
- *  - Auto-refresh tokens on real 401s OR Bubble “soft 401” (200 OK with {status:401/invalid_token} in body)
+ *  - Auto-refresh tokens on real 401s OR Bubble “soft 401”
  *  - Pre-emptive (skew) refresh before expiry
  *  - Optional local thermostat selection (skip allowed)
  *  - Poll ha_therm_status every 20 minutes
  *  - Expose Reset button + Status as child devices for Hubitat Dashboard
- *  - View last payload via app page or /status
- *  - Runtime tracking identical to legacy app (per-device sessions w/ cleanup + stats)
+ *  - Status page with last payload
  *
  *  © 2025 Eric Hanfman — Apache 2.0
  */
@@ -24,7 +23,7 @@ import groovy.transform.Field
 @Field static final String DEFAULT_REFRESH_URL   = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_refresh_token"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
-@Field static final Integer TOKEN_SKEW_SECONDS  = 60   // refresh just before expiry (seconds)
+@Field static final Integer TOKEN_SKEW_SECONDS  = 60
 
 @Field static final Set ACTIVE_STATES = ["heating","cooling","fan only"] as Set
 
@@ -59,15 +58,13 @@ def mainPage() {
 
         section("Account Link") {
             if (state.sfpAccessToken && state.sfpUserId) {
-                String hv = state.sfpHvacId ? "HVAC: ${state.sfpHvacId}" : "HVAC: (not selected)"
-                paragraph "Linked ✅  User: ${state.sfpUserId}, ${hv}"
+                String hvName = state.sfpHvacName ?: "(not selected)"
+                paragraph "Linked ✅  Thermostat: ${hvName}"
                 href name: "relinkHref", title: "Re-link / Switch HVAC", page: "linkPage",
                      description: "Update account or choose a different HVAC"
             } else {
                 input "loginEmail",    "email",    title: "Email",    required: true,  submitOnChange: true
                 input "loginPassword", "password", title: "Password", required: true,  submitOnChange: true
-                input "loginUrl", "text", title: "Login URL (advanced)",
-                     defaultValue: DEFAULT_LOGIN_URL, required: true, submitOnChange: true
 
                 def linkUrl = "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
                 logLink("/login?access_token=${getOrCreateAppToken()}")
@@ -81,22 +78,11 @@ def mainPage() {
             }
         }
 
-        section("Bubble Endpoints") {
-            input "bubbleTelemetryUrl", "text", title: "Telemetry URL",
-                 defaultValue: DEFAULT_TELEMETRY_URL, required: true
-            input "bubbleStatusUrl", "text", title: "Status URL (poll target)",
-                 defaultValue: DEFAULT_STATUS_URL, required: true
-            input "bubbleRefreshUrl", "text", title: "Refresh URL",
-                 defaultValue: DEFAULT_REFRESH_URL, required: true
-            input "bubbleResetUrl", "text", title: "Reset URL",
-                 defaultValue: DEFAULT_RESET_URL, required: true
-            input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
-                 defaultValue: DEFAULT_HTTP_TIMEOUT, range: "5..120"
-        }
-
         section("Options") {
             input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true
             input "enableRetryLogic", "bool", title: "Enable HTTP Retry Logic", defaultValue: true
+            input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
+                 defaultValue: DEFAULT_HTTP_TIMEOUT, range: "5..120"
         }
 
         section("Runtime Tracking") {
@@ -125,8 +111,6 @@ def linkPage() {
         section("Sign In") {
             input "loginEmail",    "email",    title: "Email",    required: true, submitOnChange: true
             input "loginPassword", "password", title: "Password", required: true, submitOnChange: true
-            input "loginUrl", "text", title: "Login URL (advanced)",
-                 defaultValue: DEFAULT_LOGIN_URL, required: true, submitOnChange: true
 
             def linkUrl = "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
             logLink("/login?access_token=${getOrCreateAppToken()}")
@@ -148,7 +132,7 @@ def linkPage() {
 
         if (state.sfpAccessToken && state.sfpUserId) {
             section("Linked") {
-                paragraph "Access token stored. User: ${state.sfpUserId}${state.sfpHvacId ? ", HVAC: ${state.sfpHvacId}" : ""}"
+                paragraph "Account linked."
             }
         }
     }
@@ -156,12 +140,15 @@ def linkPage() {
 
 def selectHvacPage() {
     dynamicPage(name: "selectHvacPage", title: "Select HVAC", install: false, uninstall: false) {
-        Map opts = state.sfpHvacChoices ?: [:]
-        input "chosenHvac", "enum", title: "Thermostat", required: true, options: opts, submitOnChange: true
+        Map opts = (state.sfpHvacChoices ?: [:])    // id -> label (name)
+        input "chosenHvac", "enum", title: "Thermostat", required: true,
+              options: opts, submitOnChange: true
         if (settings.chosenHvac) {
-            paragraph "Selected: ${settings.chosenHvac}"
-            def saveUrl = "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(settings.chosenHvac.toString(),'UTF-8')}"
-            logLink("/chooseHvac?access_token=${getOrCreateAppToken()}&id=${settings.chosenHvac}")
+            String id    = settings.chosenHvac.toString()
+            String label = (state.sfpHvacChoices ?: [:])[id] ?: id
+            paragraph "Selected: ${label}"
+            def saveUrl = "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
+            logLink("/chooseHvac?access_token=${getOrCreateAppToken()}&id=${id}")
             href name: "saveHvacHref", title: "Save Selection",
                  style: "external", url: saveUrl, description: "Tap to save"
         }
@@ -205,7 +192,7 @@ def cloudLogin() {
             )
         }
 
-        String url = (settings.loginUrl ?: DEFAULT_LOGIN_URL).toString()
+        String url = DEFAULT_LOGIN_URL
         Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
 
         Map loginResp
@@ -230,7 +217,7 @@ def cloudLogin() {
         }
         String userId = (body?.user_id ?: "").toString()
 
-        // Gather hvac choices (ids + names if present)
+        /* ---------- Build name-aware choices ---------- */
         List ids = []
         def idRaw = body?.hvac_id
         if (idRaw instanceof List) { ids.addAll(idRaw) }
@@ -238,8 +225,20 @@ def cloudLogin() {
         if (body?.hvac_ids instanceof List) {
             body.hvac_ids.each { if (it) ids << it }
         }
-        ids = ids.collect { it.toString() }.unique()
-        List names = (body?.hvac_name instanceof List) ? body.hvac_name : []
+        ids = ids.collect { it?.toString() }.findAll { it }.unique()
+
+        List names = (body?.hvac_name instanceof List) ?
+            body.hvac_name.collect { it?.toString() } : []
+
+        Map choices    = [:]  // id -> label shown to user (prefer name)
+        Map namesById  = [:]  // id -> raw name
+        ids.eachWithIndex { String id, int idx ->
+            String nm = (idx < names.size() && names[idx]) ? names[idx] : ""
+            choices[id]   = nm ?: id
+            namesById[id] = nm
+        }
+        state.sfpHvacChoices = choices
+        state.sfpHvacNames   = namesById
 
         if (!access || !userId) {
             state.lastLoginError = "Login response missing access_token or user_id."
@@ -251,18 +250,13 @@ def cloudLogin() {
             state.sfpExpiresAt    = expires   // epoch seconds
             state.sfpUserId       = userId
 
-            Map choices = [:]
-            ids.eachWithIndex { String id, int idx ->
-                String name = (idx < names.size() && names[idx]) ? names[idx].toString() : ""
-                String label = name ? "${id} — ${name}" : "${id}"
-                choices[id] = label
-            }
-
             if (choices.size() == 1) {
-                state.sfpHvacId = choices.keySet().asList()[0]
+                String onlyId = choices.keySet().asList()[0]
+                state.sfpHvacId   = onlyId
+                state.sfpHvacName = namesById[onlyId] ?: choices[onlyId]
             } else if (choices.size() > 1) {
-                state.sfpHvacChoices = choices
-                state.sfpHvacId = null
+                state.sfpHvacId   = null
+                state.sfpHvacName = null
             }
 
             // Clear sensitive input after use
@@ -278,10 +272,14 @@ def cloudLogin() {
     )
 }
 
-/** Saves the selected HVAC id (when multiple were returned). */
+/** Saves the selected HVAC id and its name. */
 def cloudChooseHvac() {
-    def id = params?.id
-    if (id) state.sfpHvacId = URLDecoder.decode(id.toString(), "UTF-8")
+    def id = params?.id?.toString()
+    if (id) {
+        state.sfpHvacId = URLDecoder.decode(id, "UTF-8")
+        String lbl = (state.sfpHvacNames ?: [:])[state.sfpHvacId] ?: (state.sfpHvacChoices ?: [:])[state.sfpHvacId]
+        state.sfpHvacName = (lbl ?: "").toString()
+    }
     render(contentType: "text/html",
         data: """<html><body><h3>Saved. Close this tab and return to the app.</h3></body></html>"""
     )
@@ -311,7 +309,6 @@ def updated() {
     unschedule()
     ensureChildren()
 
-    // Optional: clear all sessions on save
     if (settings.resetAllSessions) {
         resetAllDeviceSessions()
         app.updateSetting("resetAllSessions", [value:false, type:"bool"])
@@ -321,7 +318,6 @@ def updated() {
 }
 
 def initialize() {
-    // Optional thermostat subscriptions (skip allowed)
     if (settings.thermostat) {
         subscribe(settings.thermostat, "thermostatOperatingState", handleEvent)
         subscribe(settings.thermostat, "temperature", handleEvent)
@@ -329,28 +325,24 @@ def initialize() {
         if (enableDebugLogging) log.debug "No Hubitat thermostat selected; telemetry disabled."
     }
 
-    // ✅ Correct scheduling
     unschedule()
-    schedule("0 0/20 * * * ?", "pollStatus")  // every 20 minutes
-    runIn(5, "pollStatus")                    // one-time kick after 5s
+    schedule("0 0/20 * * * ?", "pollStatus")
+    runIn(5, "pollStatus")
 
-    // Session maintenance & stats
     scheduleCleanup()
-    if (settings.enableSessionStats) {
-        runEvery15Minutes(logSessionStats)
-    }
+    if (settings.enableSessionStats) runEvery15Minutes(logSessionStats)
 
-    log.info "✅ Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacId ?: '(none)'}"
+    log.info "✅ Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'}"
 }
 
-/* ============================== TELEMETRY (LEGACY-MATCH RUNTIME) ============================== */
+/* ============================== TELEMETRY ============================== */
 
 private Map _buildTelemetryPayload(Integer runtimeSecondsVal) {
     def t = settings.thermostat
     if (!t) return [:]
 
     def deviceId   = t?.getId()
-    def deviceName = t?.displayName
+    def deviceName = state.sfpHvacName ?: t?.displayName
     def tempF      = t?.currentTemperature
     def mode       = t?.currentThermostatMode
     def op         = t?.currentThermostatOperatingState
@@ -359,7 +351,6 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal) {
     def vendor     = t?.getDataValue("manufacturer") ?: t?.getManufacturerName()
     def timestamp  = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
 
-    // EXACT payload shape required
     return [
         userId            : state.sfpUserId,
         thermostatId      : state.sfpHvacId,
@@ -369,10 +360,9 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal) {
         vendor            : vendor,
         thermostatMode    : mode,
         temperatureScale  : scale,
-        runtimeSeconds    : runtimeSecondsVal,   // 0 unless a run just ended
+        runtimeSeconds    : runtimeSecondsVal,
         timestamp         : timestamp,
 
-        // Supplemental (safe):
         hubitat_deviceId  : deviceId,
         ts                : timestamp
     ]
@@ -390,18 +380,16 @@ def handleEvent(evt) {
     def op         = t?.currentThermostatOperatingState
     boolean isActive = ACTIVE_STATES.contains(op?.toString()?.toLowerCase())
 
-    // === Legacy session model (per user+device keys) ===
     def userId       = state.sfpUserId
     def key          = "${userId}-${deviceId}"
     def sessionKey   = "sessionStart_${key}"
     def wasActiveKey = "wasActive_${key}"
     int  maxRuntimeSec = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600
 
-    Integer runtimeSeconds = 0 // Always included (legacy behavior)
+    Integer runtimeSeconds = 0
     boolean wasActive = (state[wasActiveKey] as Boolean) ?: false
     Long    sessionStart = (state[sessionKey] as Long)
 
-    // Guard against future start
     if (sessionStart && sessionStart > now()) {
         if (enableDebugLogging) log.error "❌ Future sessionStart for ${key}; resetting"
         state.remove(sessionKey)
@@ -409,36 +397,22 @@ def handleEvent(evt) {
     }
 
     if (isActive && !wasActive) {
-        // OFF -> ON : start session
         state[sessionKey] = now()
         if (enableDebugLogging) log.debug "🟢 Starting new session for ${key}"
-
     } else if (!isActive && wasActive) {
-        // ON -> OFF : compute runtime
         if (sessionStart) {
             def currentTime = now()
             runtimeSeconds = ((currentTime - sessionStart) / 1000) as int
-
-            if (runtimeSeconds > maxRuntimeSec) {
-                if (enableDebugLogging) log.warn "⚠️ Runtime ${runtimeSeconds}s > cap ${maxRuntimeSec}s for ${key}; setting 0"
-                runtimeSeconds = 0
-            } else if (runtimeSeconds < 0) {
-                if (enableDebugLogging) log.error "❌ Negative runtime for ${key}; setting 0"
-                runtimeSeconds = 0
-            }
+            if (runtimeSeconds > maxRuntimeSec || runtimeSeconds < 0) runtimeSeconds = 0
             state.remove(sessionKey)
             if (enableDebugLogging) log.debug "🔴 Session ended for ${key}, runtime=${runtimeSeconds}s"
         } else {
             if (enableDebugLogging) log.warn "⚠️ Turned off but no sessionStart for ${key}"
         }
-
     } else if (isActive && wasActive && !sessionStart) {
-        // Active but missing start (e.g., app restart mid-run)
         state[sessionKey] = now()
         if (enableDebugLogging) log.debug "🔄 Active without start; seeding start for ${key}"
-
     } else if (isActive && wasActive && sessionStart) {
-        // Long-running session guard
         def ageSec = ((now() - sessionStart) / 1000) as long
         if (ageSec > maxRuntimeSec) {
             if (enableDebugLogging) log.warn "⚠️ Session age ${Math.round(ageSec/3600)}h exceeds cap; restarting for ${key}"
@@ -448,14 +422,60 @@ def handleEvent(evt) {
 
     state[wasActiveKey] = isActive
 
-    // Build & POST
     def payload = _buildTelemetryPayload(runtimeSeconds)
-    _authorizedPost((settings.bubbleTelemetryUrl ?: DEFAULT_TELEMETRY_URL).toString(), payload)
+    _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
 
     if (enableDebugLogging) {
         log.debug "📤 Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s"
     }
 }
+
+/* ---------- STATUS NORMALIZATION ---------- */
+
+// case-insensitive, ignores spaces/underscores/dots
+private def _pick(Map m, List<String> candidates) {
+    if (!m) return null
+    Map norm = [:]
+    m.each { k, v ->
+        if (k != null) {
+            String nk = k.toString().toLowerCase().replaceAll(/[^a-z0-9]/, "")
+            norm[nk] = v
+        }
+    }
+    for (String c : candidates) {
+        String nc = c.toLowerCase().replaceAll(/[^a-z0-9]/, "")
+        if (norm.containsKey(nc)) return norm[nc]
+    }
+    return null
+}
+
+// Convert Bubble’s varying keys → stable keys our child device expects
+private Map normalizeStatus(Map raw) {
+    Map out = [:]
+    if (!raw) return out
+
+    out.percentageUsed = _pick(raw, [
+        "percentage_used", "percentage used", "percent_used", "percent used",
+        "percentage", "percent"
+    ])
+
+    out.todayMinutes = _pick(raw, [
+        "today_minutes", "todays_minutes", "today", "daily_active_time_sum",
+        "2.0.1_Daily Active Time Sum"
+    ])
+
+    out.totalMinutes = _pick(raw, [
+        "total_minutes", "total_runtime", "total",
+        "minutes_active", "1.0.1_Minutes active"
+    ])
+
+    out.device_name = _pick(raw, [
+        "device_name", "thermostat_name", "hvac_name", "name"
+    ])
+
+    return out.findAll { k, v -> v != null }  // drop nulls
+}
+
 
 /* ============================== POLLING ============================== */
 
@@ -464,17 +484,14 @@ def pollStatus() {
         if (enableDebugLogging) log.debug "Poll skipped; not linked."
         return
     }
-    _ensureValidTokenSkew()  // pre-emptive refresh near expiry
+    _ensureValidTokenSkew()
 
-    String url = (settings.bubbleStatusUrl ?: DEFAULT_STATUS_URL).toString()
+    String url = DEFAULT_STATUS_URL
     Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
 
     Map body = [:]
-    if (state.sfpHvacId) {
-        body.hvac_uid = state.sfpHvacId
-    } else if (enableDebugLogging) {
-        log.debug "Polling without hvac_uid (no HVAC selected yet)"
-    }
+    if (state.sfpHvacId) body.hvac_uid = state.sfpHvacId
+    else if (enableDebugLogging) log.debug "Polling without hvac_uid (no HVAC selected yet)"
 
     def params = [
         uri: url,
@@ -485,7 +502,7 @@ def pollStatus() {
         body: body ?: [:]
     ]
 
-    if (enableDebugLogging) log.debug "📥 Polling ha_therm_status @ ${url} (hvac_uid=${state.sfpHvacId ?: '(none)'})"
+    if (enableDebugLogging) log.debug "📥 Polling ha_therm_status @ ${url} (hvac=${state.sfpHvacName ?: '(none)'})"
 
     try {
         httpPost(params) { resp ->
@@ -500,18 +517,19 @@ def pollStatus() {
                     return
                 }
 
-                state.sfpLastStatus = b ?: [:]
-                updateStatusChild(state.sfpLastStatus)
+                Map normalized = normalizeStatus(b ?: [:])
+				state.sfpLastStatus = normalized
+				updateStatusChild(normalized)
+
 
                 if (enableDebugLogging) {
                     if (state.sfpLastStatus.isEmpty()) {
-                        log.debug "Poll OK but empty payload. Raw top-level keys: ${js?.keySet()} (response keys: ${(js?.response instanceof Map) ? js.response.keySet() : 'n/a'})"
+                        log.debug "Poll OK but empty payload. Keys: ${js?.keySet()}"
                     } else {
                         log.debug "✅ Poll OK; keys=${state.sfpLastStatus.keySet()}"
                     }
                 }
             } else if (resp.status == 401) {
-                if (enableDebugLogging) log.warn "401 on poll — attempting refresh now"
                 if (_refreshToken()) _retryPoll()
             } else {
                 log.warn "Poll non-OK status: ${resp.status}"
@@ -519,7 +537,6 @@ def pollStatus() {
         }
     } catch (groovyx.net.http.HttpResponseException e) {
         if ((e.statusCode as Integer) == 401) {
-            if (enableDebugLogging) log.warn "401 on poll (exception) — attempting refresh"
             if (_refreshToken()) _retryPoll()
         } else {
             log.error "Poll HTTP ${e.statusCode}: ${e.message}"
@@ -529,25 +546,18 @@ def pollStatus() {
     }
 }
 
-private void _retryPoll() {
-    runIn(3, "pollStatus") // Retry once shortly after refresh
-}
+private void _retryPoll() { runIn(3, "pollStatus") }
 
 /* ============================== SESSION MAINTENANCE & STATS ============================== */
 
 def scheduleCleanup() {
     unschedule(cleanupOldSessions)
     switch ((settings.cleanupFrequency ?: "1 Hour") as String) {
-        case "30 Minutes":
-            runEvery30Minutes(cleanupOldSessions); break
-        case "2 Hours":
-            schedule("0 0 */2 * * ?", cleanupOldSessions); break
-        case "6 Hours":
-            schedule("0 0 */6 * * ?", cleanupOldSessions); break
-        case "12 Hours":
-            schedule("0 0 */12 * * ?", cleanupOldSessions); break
-        default:
-            runEvery1Hour(cleanupOldSessions); break
+        case "30 Minutes": runEvery30Minutes(cleanupOldSessions); break
+        case "2 Hours"   : schedule("0 0 */2 * * ?", cleanupOldSessions); break
+        case "6 Hours"   : schedule("0 0 */6 * * ?", cleanupOldSessions); break
+        case "12 Hours"  : schedule("0 0 */12 * * ?", cleanupOldSessions); break
+        default          : runEvery1Hour(cleanupOldSessions); break
     }
 }
 
@@ -603,42 +613,16 @@ def getSessionStats() {
     if (enableDebugLogging) {
         log.debug "📊 Stats: active=${activeSessions}, total=${totalDevices}, oldest=${oldestAgeMin} min"
     }
-    return [
-        activeSessions: activeSessions,
-        totalDevices: totalDevices,
-        oldestSessionMinutes: oldestAgeMin
-    ]
+    return [activeSessions: activeSessions, totalDevices: totalDevices, oldestSessionMinutes: oldestAgeMin]
 }
 
 def resetAllDeviceSessions() {
     List keysToRemove = []
     state.each { k, v ->
-        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_")) {
-            keysToRemove << k
-        }
+        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_")) keysToRemove << k
     }
     keysToRemove.each { state.remove(it) }
     log.warn "🔄 RESET: Cleared ${keysToRemove.size()} session-tracking entries"
-}
-
-// Optional helpers (debugging)
-def getCurrentRuntime(userId, deviceId) {
-    def key = "${userId}-${deviceId}"
-    def sessionKey = "sessionStart_${key}"
-    def wasActiveKey = "wasActive_${key}"
-    boolean isActive = (state[wasActiveKey] as Boolean) ?: false
-    Long sessionStart = (state[sessionKey] as Long)
-    if (isActive && sessionStart) {
-        return (((now() - sessionStart) / 1000) as int)
-    }
-    return 0
-}
-
-def resetDeviceSession(userId, deviceId) {
-    def key = "${userId}-${deviceId}"
-    state.remove("sessionStart_${key}")
-    state.remove("wasActive_${key}")
-    if (enableDebugLogging) log.debug "🔄 Reset session for device: ${key}"
 }
 
 /* ============================== AUTH HELPERS ============================== */
@@ -667,7 +651,7 @@ private boolean _isBubbleSoft401(Map body) {
 }
 
 private boolean _ensureValidTokenSkew() {
-    Long exp = (state.sfpExpiresAt as Long)   // epoch seconds
+    Long exp = (state.sfpExpiresAt as Long)
     if (!exp) return true
     Long nowSec = (now() / 1000L) as Long
     if (nowSec >= (exp - TOKEN_SKEW_SECONDS)) {
@@ -678,7 +662,7 @@ private boolean _ensureValidTokenSkew() {
 }
 
 private boolean _refreshToken() {
-    String refreshUrl = (settings.bubbleRefreshUrl ?: DEFAULT_REFRESH_URL).toString()
+    String refreshTarget = DEFAULT_REFRESH_URL
     String rt = (state.sfpRefreshToken ?: "").toString()
     Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
 
@@ -690,7 +674,7 @@ private boolean _refreshToken() {
     try {
         Map respMap
         httpPost([
-            uri: refreshUrl,
+            uri: refreshTarget,
             contentType: "application/json",
             requestContentType: "application/json",
             timeout: timeoutSec,
@@ -732,7 +716,7 @@ private boolean _refreshToken() {
 /* ============================== HTTP HELPERS ============================== */
 
 private void _authorizedPost(String url, Map payload) {
-    _ensureValidTokenSkew()  // pre-emptive refresh near expiry
+    _ensureValidTokenSkew()
 
     Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
     Map params = [
@@ -756,21 +740,15 @@ private void _authorizedPost(String url, Map payload) {
                 Map b  = _bubbleBody(js)
 
                 if (_isBubbleSoft401(b)) {
-                    if (enableDebugLogging) log.warn "Soft-401 on telemetry — attempting refresh"
                     if (_refreshToken()) {
-                        httpPost(params) { r2 ->
-                            if (enableDebugLogging) log.debug "Telemetry retry status: ${r2.status}"
-                        }
+                        httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
                     }
                 } else {
                     if (enableDebugLogging) log.debug "✅ Telemetry OK (${resp.status})"
                 }
             } else if (resp.status == 401) {
-                if (enableDebugLogging) log.warn "401 on telemetry — attempting refresh"
                 if (_refreshToken()) {
-                    httpPost(params) { r2 ->
-                        if (enableDebugLogging) log.debug "Telemetry retry status: ${r2.status}"
-                    }
+                    httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
                 }
             } else {
                 log.warn "Telemetry non-OK status: ${resp.status}"
@@ -778,15 +756,10 @@ private void _authorizedPost(String url, Map payload) {
         }
     } catch (groovyx.net.http.HttpResponseException e) {
         if ((e.statusCode as Integer) == 401) {
-            if (enableDebugLogging) log.warn "401 on telemetry (exception) — attempting refresh"
             if (_refreshToken()) {
                 try {
-                    httpPost(params) { r2 ->
-                        if (enableDebugLogging) log.debug "Telemetry retry status: ${r2.status}"
-                    }
-                } catch (Exception ex) {
-                    log.error "Telemetry retry error: ${ex}"
-                }
+                    httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
+                } catch (Exception ex) { log.error "Telemetry retry error: ${ex}" }
             }
         } else {
             log.error "Telemetry HTTP ${e.statusCode}: ${e.message}"
@@ -817,16 +790,25 @@ private void ensureChildren() {
 private void updateStatusChild(Map payload) {
     def d = getChildDevice("sfp-${app.id}-status")
     if (!d) return
-    d.sendEvent(name:"percentageUsed", value: (payload.percentage_used ?: payload.percentage ?: payload.percent_used))
-    d.sendEvent(name:"todayMinutes",   value: (payload.today_minutes ?: payload.today ?: payload.todays_minutes))
-    d.sendEvent(name:"totalMinutes",   value: (payload.total_minutes ?: payload.total ?: payload.total_runtime))
-    if (payload.device_name) d.sendEvent(name:"deviceName", value: payload.device_name)
-    d.sendEvent(name:"lastUpdated", value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
+
+    def pct   = payload.percentageUsed
+    def today = payload.todayMinutes
+    def total = payload.totalMinutes
+    def name  = payload.device_name ?: state.sfpHvacName
+
+    if (pct   != null) d.sendEvent(name:"percentageUsed", value: pct)
+    if (today != null) d.sendEvent(name:"todayMinutes",   value: today)
+    if (total != null) d.sendEvent(name:"totalMinutes",   value: total)
+    if (name)          d.sendEvent(name:"deviceName",     value: name)
+
+    d.sendEvent(name:"lastUpdated",
+        value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
 }
+
 
 // called by the Reset child driver
 def resetNow() {
-    String url = (settings.bubbleResetUrl ?: DEFAULT_RESET_URL).toString()
+    String url = DEFAULT_RESET_URL
     if (!state.sfpAccessToken || !state.sfpUserId || !state.sfpHvacId) {
         log.warn "Reset skipped; missing token/user/hvac."
         return
@@ -834,14 +816,13 @@ def resetNow() {
     _ensureValidTokenSkew()
     Map payload = [user_id: state.sfpUserId, hvac_id: state.sfpHvacId]
     _authorizedPost(url, payload)
-    // kick a status refresh after a few seconds
     runIn(3, "pollStatus")
 }
 
 // called by the Status child driver ("Refresh" command)
 def pollNow() { pollStatus() }
 
-/* ============================== HELPERS ============================== */
+/* ============================== LINK HELPERS ============================== */
 
 def cloudShowStatusLink() {
     return "${appEndpointBase()}/status?access_token=${getOrCreateAppToken()}"
@@ -855,16 +836,13 @@ private String getOrCreateAppToken() {
     return state.appAccessToken
 }
 
-// Try to obtain hub UID for cloud URL shaping
 private String hubUidSafe() {
     try { return getHubUID() }
     catch (e) { return location?.hubs?.first()?.id }
 }
 
-// Build correct base for BOTH cloud and local UIs.
 private String appEndpointBase() {
     String base = getApiServerUrl() ?: ""
-    // Cloud: base could be 'https://cloud.hubitat.com/api' or 'https://cloud.hubitat.com/api/<hubId>'
     if (base.startsWith("https://cloud.hubitat.com")) {
         if (base ==~ /https:\/\/cloud\.hubitat\.com\/api\/[A-Za-z0-9-]+.*/) {
             return "${base}/apps/${app.id}"
@@ -872,11 +850,9 @@ private String appEndpointBase() {
             return "https://cloud.hubitat.com/api/${hubUidSafe()}/apps/${app.id}"
         }
     }
-    // Local
     return "${base}/apps/api/${app.id}"
 }
 
-// Log the final link used (helps debug URL shape)
 private void logLink(String pathWithQuery) {
     def full = "${appEndpointBase()}${pathWithQuery}"
     log.info "SmartFilterPro link → ${full}"
