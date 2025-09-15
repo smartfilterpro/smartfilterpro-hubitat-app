@@ -7,6 +7,7 @@
  *  - Poll ha_therm_status every 20 minutes
  *  - Expose Reset button + Status as child devices for Hubitat Dashboard
  *  - Status page with last payload
+ *  - ADDED: isReachable, ConnectivityStatusChanged, last* snapshot on session end
  *
  *  © 2025 Eric Hanfman — Apache 2.0
  */
@@ -26,6 +27,10 @@ import groovy.transform.Field
 @Field static final Integer TOKEN_SKEW_SECONDS  = 60
 
 @Field static final Set ACTIVE_STATES = ["heating","cooling","fan only"] as Set
+
+// ADDED: Connectivity defaults
+@Field static final Integer DEFAULT_STALE_MINUTES = 15
+@Field static final Integer DEFAULT_SCAN_MINUTES  = 1
 
 /* ============================== METADATA ============================== */
 
@@ -89,6 +94,18 @@ def mainPage() {
             input "maxRuntimeHours", "number",
                 title: "Maximum Runtime Hours (cap a single session)",
                 defaultValue: 24, range: "1..168"
+        }
+
+        section("Connectivity (Reachability)") {
+            input "reachabilityStaleMinutes", "number",
+                title: "Mark device unreachable after N minutes without any events",
+                defaultValue: DEFAULT_STALE_MINUTES, range: "1..180"
+            input "connectivityScanMinutes", "number",
+                title: "Scan frequency (minutes)",
+                defaultValue: DEFAULT_SCAN_MINUTES, range: "1..30"
+            input "publishConnectivity", "bool",
+                title: "Send ConnectivityStatusChanged events to Bubble",
+                defaultValue: true
         }
 
         section("Session Maintenance & Stats") {
@@ -329,6 +346,10 @@ def initialize() {
     schedule("0 0/20 * * * ?", "pollStatus")
     runIn(5, "pollStatus")
 
+    // Connectivity scanner
+    Integer scanMins  = ((settings.connectivityScanMinutes ?: DEFAULT_SCAN_MINUTES) as Integer)
+    schedule("0 0/${scanMins} * * * ?", "checkConnectivity")
+
     scheduleCleanup()
     if (settings.enableSessionStats) runEvery15Minutes(logSessionStats)
 
@@ -337,22 +358,98 @@ def initialize() {
 
 /* ============================== TELEMETRY ============================== */
 
-private Map _buildTelemetryPayload(Integer runtimeSecondsVal) {
+// ---------- ADDED helpers: normalization & connectivity ----------
+
+// Normalize Hubitat operating state → heating|cooling|fanonly|idle|unknown
+private String _normOp(def op) {
+    String s = op?.toString()?.toLowerCase() ?: ""
+    if (s.contains("cool")) return "cooling"
+    if (s.contains("heat")) return "heating"
+    if (s.contains("fan"))  return "fanonly"
+    if (s.contains("idle") || s == "off") return "idle"
+    return "unknown"
+}
+
+// Per-device state keys
+private String _kSessionStart(String userId, String devId) { "sessionStart_${userId}-${devId}" }
+private String _kWasActive(String userId, String devId)  { "wasActive_${userId}-${devId}" }
+private String _kSessionLast(String userId, String devId){ "sessionLast_${userId}-${devId}" }
+private String _kReachable(String userId, String devId)  { "isReachable_${userId}-${devId}" }
+private String _kLastSeen(String userId, String devId)   { "lastSeen_${userId}-${devId}" }
+
+// Connectivity: mark seen (reachable) and optionally post flip event
+private void _markSeen(String userId, String devId) {
+    String kR = _kReachable(userId, devId)
+    String kS = _kLastSeen(userId, devId)
+    Boolean was = (state[kR] as Boolean)
+    state[kS] = now()
+    state[kR] = true
+    if (publishConnectivity && was == false) {
+        _postConnectivityChange(true, userId, devId, "event_seen")
+    }
+}
+
+// Connectivity: maybe mark unreachable if stale
+private boolean _maybeMarkUnreachableIfStale(String userId, String devId, Long nowMs, Long staleMs) {
+    String kR = _kReachable(userId, devId)
+    String kS = _kLastSeen(userId, devId)
+    Long last = (state[kS] as Long) ?: 0L
+    if ((nowMs - last) > staleMs && (state[kR] as Boolean) != false) {
+        state[kR] = false
+        if (publishConnectivity) _postConnectivityChange(false, userId, devId, "stale_timeout")
+        return true
+    }
+    return false
+}
+
+// POST minimal connectivity event
+private void _postConnectivityChange(boolean isReachable, String userId, String devId, String reason) {
+    def t = settings.thermostat
+    def payload = [
+        userId       : userId,
+        thermostatId : state.sfpHvacId,
+        hubitat_deviceId: devId,
+        deviceName   : state.sfpHvacName ?: t?.displayName,
+        eventType    : "ConnectivityStatusChanged",
+        isReachable  : isReachable,
+        ts           : new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX", location.timeZone),
+        reason       : reason
+    ]
+    _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
+    if (enableDebugLogging) log.debug "📶 ConnectivityStatusChanged: ${devId} → ${isReachable} (${reason})"
+}
+
+def checkConnectivity() {
+    if (!settings.thermostat || !state.sfpUserId) return
+    String userId = state.sfpUserId
+    String devId  = settings.thermostat?.getId()?.toString()
+    if (!devId) return
+    Long nowMs = now()
+    Long staleMs = ((settings.reachabilityStaleMinutes ?: DEFAULT_STALE_MINUTES) as Integer) * 60_000L
+    _maybeMarkUnreachableIfStale(userId, devId, nowMs, staleMs)
+}
+
+private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot = null) {
     def t = settings.thermostat
     if (!t) return [:]
 
-    def deviceId   = t?.getId()
+    String userId   = state.sfpUserId
+    String devId    = t?.getId()?.toString()
+    String kReach   = _kReachable(userId, devId)
+    Boolean isReach = (state[kReach] as Boolean)
+    if (isReach == null) isReach = true
+
     def deviceName = state.sfpHvacName ?: t?.displayName
     def tempF      = t?.currentTemperature
     def mode       = t?.currentThermostatMode
-    def op         = t?.currentThermostatOperatingState
-    def isActive   = ACTIVE_STATES.contains(op?.toString()?.toLowerCase())
+    def opRaw      = t?.currentThermostatOperatingState
+    boolean isActive = ACTIVE_STATES.contains(opRaw?.toString()?.toLowerCase())
     def scale      = location.temperatureScale
     def vendor     = t?.getDataValue("manufacturer") ?: t?.getManufacturerName()
     def timestamp  = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
 
-    return [
-        userId            : state.sfpUserId,
+    Map out = [
+        userId            : userId,
         thermostatId      : state.sfpHvacId,
         currentTemperature: tempF,
         isActive          : isActive,
@@ -362,10 +459,16 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal) {
         temperatureScale  : scale,
         runtimeSeconds    : runtimeSecondsVal,
         timestamp         : timestamp,
-
-        hubitat_deviceId  : deviceId,
-        ts                : timestamp
+        hubitat_deviceId  : devId,
+        ts                : timestamp,
+        // isReachable on every post
+        isReachable       : isReach
     ]
+
+    // Include last* fields when provided (session end)
+    if (lastSnapshot) out << lastSnapshot
+
+    return out
 }
 
 def handleEvent(evt) {
@@ -376,14 +479,19 @@ def handleEvent(evt) {
     }
 
     def t = settings.thermostat
-    def deviceId   = t?.getId()
+    def deviceId   = t?.getId()?.toString()
     def op         = t?.currentThermostatOperatingState
     boolean isActive = ACTIVE_STATES.contains(op?.toString()?.toLowerCase())
 
     def userId       = state.sfpUserId
     def key          = "${userId}-${deviceId}"
-    def sessionKey   = "sessionStart_${key}"
-    def wasActiveKey = "wasActive_${key}"
+    def sessionKey   = _kSessionStart(userId, deviceId)
+    def wasActiveKey = _kWasActive(userId, deviceId)
+    def sessionLastKey = _kSessionLast(userId, deviceId)
+
+    // Reachability mark-seen on any event
+    _markSeen(userId, deviceId)
+
     int  maxRuntimeSec = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600
 
     Integer runtimeSeconds = 0
@@ -394,6 +502,18 @@ def handleEvent(evt) {
         if (enableDebugLogging) log.error "❌ Future sessionStart for ${key}; resetting"
         state.remove(sessionKey)
         sessionStart = null
+    }
+
+    // Track last* snapshot whenever active (heating/cooling/fanonly)
+    String lastModeCandidate = _normOp(op)
+    if (["heating","cooling","fanonly"].contains(lastModeCandidate)) {
+        state[sessionLastKey] = [
+            lastMode           : lastModeCandidate,
+            lastIsHeating      : (lastModeCandidate == "heating"),
+            lastIsCooling      : (lastModeCandidate == "cooling"),
+            lastIsFanOnly      : (lastModeCandidate == "fanonly"),
+            lastEquipmentStatus: lastModeCandidate
+        ]
     }
 
     if (isActive && !wasActive) {
@@ -422,11 +542,29 @@ def handleEvent(evt) {
 
     state[wasActiveKey] = isActive
 
-    def payload = _buildTelemetryPayload(runtimeSeconds)
+    // Build payload; if we just ended a session, attach last*
+    Map lastSnap = null
+    if (!isActive && wasActive) {
+        lastSnap = (state[sessionLastKey] as Map)
+        if (!lastSnap) {
+            String m = _normOp(op)
+            lastSnap = [
+                lastMode: m,
+                lastIsHeating: (m == "heating"),
+                lastIsCooling: (m == "cooling"),
+                lastIsFanOnly: (m == "fanonly"),
+                lastEquipmentStatus: m
+            ]
+        }
+        // clear snapshot after consumption
+        state.remove(sessionLastKey)
+    }
+
+    def payload = _buildTelemetryPayload(runtimeSeconds, lastSnap)
     _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
 
     if (enableDebugLogging) {
-        log.debug "📤 Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s"
+        log.debug "📤 Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s, isReachable=${payload.isReachable}${ lastSnap ? ", lastMode=${lastSnap.lastMode}" : "" }"
     }
 }
 
@@ -518,9 +656,19 @@ def pollStatus() {
                 }
 
                 Map normalized = normalizeStatus(b ?: [:])
-				state.sfpLastStatus = normalized
-				updateStatusChild(normalized)
 
+                // Add current reachability to status payload for dashboard convenience
+                try {
+                    String userId = state.sfpUserId
+                    String devId  = settings.thermostat?.getId()?.toString()
+                    if (userId && devId) {
+                        Boolean isReach = (state[_kReachable(userId, devId)] as Boolean)
+                        if (isReach != null) normalized.isReachable = isReach
+                    }
+                } catch (ignored) {}
+
+                state.sfpLastStatus = normalized
+                updateStatusChild(normalized)
 
                 if (enableDebugLogging) {
                     if (state.sfpLastStatus.isEmpty()) {
@@ -582,6 +730,7 @@ def cleanupOldSessions() {
         state.remove(key)
         def deviceKey = key.replace("sessionStart_", "")
         state.remove("wasActive_${deviceKey}")
+        state.remove("sessionLast_${deviceKey}") // also clear last snapshot if stale
     }
 
     if (keysToRemove.size() > 0 && enableDebugLogging) {
@@ -619,7 +768,7 @@ def getSessionStats() {
 def resetAllDeviceSessions() {
     List keysToRemove = []
     state.each { k, v ->
-        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_")) keysToRemove << k
+        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_") || k.startsWith("sessionLast_")) keysToRemove << k
     }
     keysToRemove.each { state.remove(it) }
     log.warn "🔄 RESET: Cleared ${keysToRemove.size()} session-tracking entries"
