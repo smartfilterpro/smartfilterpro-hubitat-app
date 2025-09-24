@@ -1,13 +1,14 @@
 /**
  *  SmartFilterPro Thermostat Bridge (Hubitat)
  *  - Link with email/password → Bubble returns access_token/refresh_token/user_id/hvac(s)
- *  - Auto-refresh tokens on real 401s OR Bubble “soft 401”
+ *  - Auto-refresh tokens on real 401s OR Bubble "soft 401"
  *  - Pre-emptive (skew) refresh before expiry
  *  - Optional local thermostat selection (skip allowed)
  *  - Poll ha_therm_status every 20 minutes
  *  - Expose Reset button + Status as child devices for Hubitat Dashboard
  *  - Status page with last payload
- *  - ADDED: isReachable, ConnectivityStatusChanged, last* snapshot on session end
+ *  - ADDED: isReachable (DeviceWatch/health/presence aware), ConnectivityStatusChanged, last* snapshot on session end
+ *  - FIXED: Runtime calculation logic and session management race conditions
  *
  *  © 2025 Eric Hanfman — Apache 2.0
  */
@@ -17,7 +18,7 @@ import groovy.transform.Field
 /* ============================== CONSTANTS ============================== */
 
 @Field static final String DEFAULT_LOGIN_URL     = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_password_login"
-// MUST be lowercase ‘hubitat’ per requirement
+// MUST be lowercase 'hubitat' per requirement
 @Field static final String DEFAULT_TELEMETRY_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat"
 @Field static final String DEFAULT_STATUS_URL    = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_therm_status"
 @Field static final String DEFAULT_RESET_URL     = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_reset_filter"
@@ -40,8 +41,8 @@ definition (
     author: "Eric Hanfman",
     description: "Sends thermostat state & runtime to SmartFilterPro (Bubble) and polls status.",
     category: "Convenience",
-    iconUrl: "",
-    iconX2Url: ""
+    iconUrl: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg",
+    iconX2Url: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg"
 )
 
 preferences {
@@ -135,7 +136,7 @@ def linkPage() {
                  style: "external", description: "Tap to authenticate now (opens new tab)",
                  url: linkUrl, state: "complete"
 
-            paragraph "After tapping, return to this page. If you have multiple thermostats, you’ll get a 'Select HVAC' link."
+            paragraph "After tapping, return to this page. If you have multiple thermostats, you'll get a 'Select HVAC' link."
         }
 
         if (state.lastLoginError) {
@@ -315,13 +316,13 @@ def cloudShowStatus() {
 /* ============================== LIFECYCLE ============================== */
 
 def installed() {
-    log.info "🚀 SmartFilterPro Thermostat Bridge installed"
+    log.info "SmartFilterPro Thermostat Bridge installed"
     ensureChildren()
     initialize()
 }
 
 def updated() {
-    log.info "🔄 SmartFilterPro Thermostat Bridge updated"
+    log.info "SmartFilterPro Thermostat Bridge updated"
     unsubscribe()
     unschedule()
     ensureChildren()
@@ -337,7 +338,12 @@ def updated() {
 def initialize() {
     if (settings.thermostat) {
         subscribe(settings.thermostat, "thermostatOperatingState", handleEvent)
-        subscribe(settings.thermostat, "temperature", handleEvent)
+        subscribe(settings.thermostat, "temperature",               handleEvent)
+
+        // NEW: explicit reachability signals
+        subscribe(settings.thermostat, "DeviceWatch-DeviceStatus",  handleReachabilityEvent)
+        subscribe(settings.thermostat, "healthStatus",              handleReachabilityEvent)   // "online"/"offline"
+        subscribe(settings.thermostat, "presence",                  handleReachabilityEvent)   // "present"/"not present"
     } else {
         if (enableDebugLogging) log.debug "No Hubitat thermostat selected; telemetry disabled."
     }
@@ -353,7 +359,7 @@ def initialize() {
     scheduleCleanup()
     if (settings.enableSessionStats) runEvery15Minutes(logSessionStats)
 
-    log.info "✅ Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'}"
+    log.info "Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'}"
 }
 
 /* ============================== TELEMETRY ============================== */
@@ -409,24 +415,80 @@ private void _postConnectivityChange(boolean isReachable, String userId, String 
         userId       : userId,
         thermostatId : state.sfpHvacId,
         hubitat_deviceId: devId,
-        deviceName   : state.sfpHvacName ?: t?.displayName,
+        deviceName   : (t?.displayName ?: t?.label ?: t?.name) ?: state.sfpHvacName,
         eventType    : "ConnectivityStatusChanged",
         isReachable  : isReachable,
         ts           : new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX", location.timeZone),
         reason       : reason
     ]
     _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
-    if (enableDebugLogging) log.debug "📶 ConnectivityStatusChanged: ${devId} → ${isReachable} (${reason})"
+    if (enableDebugLogging) log.debug "ConnectivityStatusChanged: ${devId} → ${isReachable} (${reason})"
 }
 
-def checkConnectivity() {
+// NEW: Handler for explicit reachability attributes
+def handleReachabilityEvent(evt) {
     if (!settings.thermostat || !state.sfpUserId) return
+
+    String attr = (evt?.name ?: "").toString()
+    String val  = (evt?.value ?: "").toString()
+    if (enableDebugLogging) log.debug "Reachability attr=${attr} value=${val}"
+
     String userId = state.sfpUserId
     String devId  = settings.thermostat?.getId()?.toString()
     if (!devId) return
-    Long nowMs = now()
-    Long staleMs = ((settings.reachabilityStaleMinutes ?: DEFAULT_STALE_MINUTES) as Integer) * 60_000L
-    _maybeMarkUnreachableIfStale(userId, devId, nowMs, staleMs)
+
+    boolean isUp = _coerceReachValue(val)
+    String kR = _kReachable(userId, devId)
+    String kS = _kLastSeen(userId, devId)
+    Boolean was = (state[kR] as Boolean)
+
+    state[kR] = isUp
+    state[kS] = now()  // also treat as "seen" for stale fallback
+
+    if (publishConnectivity && (was == null || was != isUp)) {
+        _postConnectivityChange(isUp, userId, devId, "attr:${attr}")
+    }
+}
+
+// Maps various attribute values to a boolean
+private boolean _coerceReachValue(def v) {
+    String s = v?.toString()?.trim()?.toLowerCase()
+    if (!s) return false
+    if (["online","present","true","1","up","reachable"].contains(s)) return true
+    if (["offline","not present","false","0","down","unreachable"].contains(s)) return false
+    return false
+}
+
+// Prefer explicit driver attributes; fallback to state/staleness
+private Boolean _computeIsReachable(String userId, String devId) {
+    def t = settings.thermostat
+    try {
+        String dw  = t?.currentValue("DeviceWatch-DeviceStatus")?.toString()
+        if (dw) return _coerceReachValue(dw)
+
+        String hs  = t?.currentValue("healthStatus")?.toString()
+        if (hs) return _coerceReachValue(hs)
+
+        String pr  = t?.currentValue("presence")?.toString()
+        if (pr) return _coerceReachValue(pr)
+    } catch (ignored) {}
+
+    // Fallback: stale timer logic / last known
+    String kR = _kReachable(userId, devId)
+    Boolean known = (state[kR] as Boolean)
+    if (known != null) return known
+
+    // default optimistic true until proven stale
+    return true
+}
+
+// FIXED: Add runtime validation helper
+private boolean isValidRuntime(int seconds, long sessionStartMs) {
+    if (seconds < 0) return false
+    if (seconds == 0) return true  // Valid for very short sessions
+    
+    long maxPossible = (now() - sessionStartMs) / 1000
+    return seconds <= (maxPossible + 60)  // Allow 60s tolerance for processing delays
 }
 
 private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot = null) {
@@ -435,11 +497,9 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot =
 
     String userId   = state.sfpUserId
     String devId    = t?.getId()?.toString()
-    String kReach   = _kReachable(userId, devId)
-    Boolean isReach = (state[kReach] as Boolean)
-    if (isReach == null) isReach = true
+    Boolean isReach = _computeIsReachable(userId, devId)
 
-    def deviceName = state.sfpHvacName ?: t?.displayName
+    def deviceName = (t?.displayName ?: t?.label ?: t?.name) ?: state.sfpHvacName
     def tempF      = t?.currentTemperature
     def mode       = t?.currentThermostatMode
     def opRaw      = t?.currentThermostatOperatingState
@@ -461,7 +521,7 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot =
         timestamp         : timestamp,
         hubitat_deviceId  : devId,
         ts                : timestamp,
-        // isReachable on every post
+        // isReachable on every post (attribute-driven if available)
         isReachable       : isReach
     ]
 
@@ -471,6 +531,7 @@ private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot =
     return out
 }
 
+// FIXED: Improved runtime calculation and session management
 def handleEvent(evt) {
     if (!settings.thermostat) return
     if (!state.sfpAccessToken || !state.sfpUserId || !state.sfpHvacId) {
@@ -492,19 +553,21 @@ def handleEvent(evt) {
     // Reachability mark-seen on any event
     _markSeen(userId, deviceId)
 
-    int  maxRuntimeSec = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600
-
+    int maxRuntimeSec = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600
     Integer runtimeSeconds = 0
+    
+    // Get previous state
     boolean wasActive = (state[wasActiveKey] as Boolean) ?: false
-    Long    sessionStart = (state[sessionKey] as Long)
+    Long sessionStart = (state[sessionKey] as Long)
 
+    // Validate session start timestamp
     if (sessionStart && sessionStart > now()) {
-        if (enableDebugLogging) log.error "❌ Future sessionStart for ${key}; resetting"
-        state.remove(sessionKey)
+        if (enableDebugLogging) log.error "Future sessionStart for ${key}; resetting"
         sessionStart = null
+        state.remove(sessionKey)
     }
 
-    // Track last* snapshot whenever active (heating/cooling/fanonly)
+    // Track last* snapshot for active states
     String lastModeCandidate = _normOp(op)
     if (["heating","cooling","fanonly"].contains(lastModeCandidate)) {
         state[sessionLastKey] = [
@@ -516,55 +579,94 @@ def handleEvent(evt) {
         ]
     }
 
+    // Handle state transitions BEFORE updating wasActive
+    Map lastSnap = null
+    boolean shouldSendTelemetry = false
+    
     if (isActive && !wasActive) {
+        // Starting new session
         state[sessionKey] = now()
-        if (enableDebugLogging) log.debug "🟢 Starting new session for ${key}"
+        if (enableDebugLogging) log.debug "Starting new session for ${key}"
+        shouldSendTelemetry = true
+        
     } else if (!isActive && wasActive) {
+        // Ending session - calculate runtime
         if (sessionStart) {
-            def currentTime = now()
-            runtimeSeconds = ((currentTime - sessionStart) / 1000) as int
-            if (runtimeSeconds > maxRuntimeSec || runtimeSeconds < 0) runtimeSeconds = 0
+            long currentTime = now()
+            long rawRuntime = currentTime - sessionStart
+            runtimeSeconds = Math.max(0, (rawRuntime / 1000) as int)
+            
+            // Warn about negative runtime but don't fail
+            if (rawRuntime < 0) {
+                log.warn "Negative runtime detected for ${key}: ${rawRuntime}ms (clock skew?)"
+            }
+            
+            // Cap runtime but report the actual duration up to the cap
+            if (runtimeSeconds > maxRuntimeSec) {
+                runtimeSeconds = maxRuntimeSec
+                if (enableDebugLogging) log.warn "Runtime capped at ${maxRuntimeSec}s for ${key}"
+            }
+            
+            // Get last snapshot before clearing
+            lastSnap = (state[sessionLastKey] as Map)
+            if (!lastSnap) {
+                String m = _normOp(op)
+                lastSnap = [
+                    lastMode: m,
+                    lastIsHeating: (m == "heating"),
+                    lastIsCooling: (m == "cooling"),
+                    lastIsFanOnly: (m == "fanonly"),
+                    lastEquipmentStatus: m
+                ]
+            }
+            
             state.remove(sessionKey)
-            if (enableDebugLogging) log.debug "🔴 Session ended for ${key}, runtime=${runtimeSeconds}s"
+            state.remove(sessionLastKey)
+            if (enableDebugLogging) log.debug "Session ended for ${key}, runtime=${runtimeSeconds}s"
+            
         } else {
-            if (enableDebugLogging) log.warn "⚠️ Turned off but no sessionStart for ${key}"
+            if (enableDebugLogging) log.warn "Device turned off but no sessionStart found for ${key}"
         }
-    } else if (isActive && wasActive && !sessionStart) {
-        state[sessionKey] = now()
-        if (enableDebugLogging) log.debug "🔄 Active without start; seeding start for ${key}"
-    } else if (isActive && wasActive && sessionStart) {
-        def ageSec = ((now() - sessionStart) / 1000) as long
-        if (ageSec > maxRuntimeSec) {
-            if (enableDebugLogging) log.warn "⚠️ Session age ${Math.round(ageSec/3600)}h exceeds cap; restarting for ${key}"
+        shouldSendTelemetry = true
+        
+    } else if (isActive && wasActive) {
+        // Device remains active - check for long-running sessions
+        if (!sessionStart) {
+            // Missing session start - create one but log the issue
             state[sessionKey] = now()
+            if (enableDebugLogging) log.warn "Active device missing sessionStart; creating new session for ${key}"
+        } else {
+            // Check if session has been running too long
+            long ageSec = (now() - sessionStart) / 1000
+            if (ageSec > maxRuntimeSec) {
+                // Report the capped session first
+                Map cappedPayload = _buildTelemetryPayload(maxRuntimeSec, null)
+                _authorizedPost(DEFAULT_TELEMETRY_URL, cappedPayload)
+                
+                // Start a new session
+                state[sessionKey] = now()
+                if (enableDebugLogging) log.warn "Session exceeded ${Math.round(ageSec/3600)}h cap; reported ${maxRuntimeSec}s and restarted for ${key}"
+                shouldSendTelemetry = false  // Already sent above
+            }
         }
     }
 
+    // Update state AFTER handling transitions
     state[wasActiveKey] = isActive
 
-    // Build payload; if we just ended a session, attach last*
-    Map lastSnap = null
-    if (!isActive && wasActive) {
-        lastSnap = (state[sessionLastKey] as Map)
-        if (!lastSnap) {
-            String m = _normOp(op)
-            lastSnap = [
-                lastMode: m,
-                lastIsHeating: (m == "heating"),
-                lastIsCooling: (m == "cooling"),
-                lastIsFanOnly: (m == "fanonly"),
-                lastEquipmentStatus: m
-            ]
+    // Only send telemetry when there's a state change or runtime to report
+    if (shouldSendTelemetry || runtimeSeconds > 0) {
+        def payload = _buildTelemetryPayload(runtimeSeconds, lastSnap)
+        _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
+
+        if (enableDebugLogging) {
+            String transition = ""
+            if (isActive && !wasActive) transition = " [OFF→ON]"
+            else if (!isActive && wasActive) transition = " [ON→OFF]"
+            else if (isActive && wasActive) transition = " [ON→ON, capped]"
+            
+            log.debug "Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s, isReachable=${payload.isReachable}${lastSnap ? ", lastMode=${lastSnap.lastMode}" : ""}${transition}"
         }
-        // clear snapshot after consumption
-        state.remove(sessionLastKey)
-    }
-
-    def payload = _buildTelemetryPayload(runtimeSeconds, lastSnap)
-    _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
-
-    if (enableDebugLogging) {
-        log.debug "📤 Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s, isReachable=${payload.isReachable}${ lastSnap ? ", lastMode=${lastSnap.lastMode}" : "" }"
     }
 }
 
@@ -587,7 +689,7 @@ private def _pick(Map m, List<String> candidates) {
     return null
 }
 
-// Convert Bubble’s varying keys → stable keys our child device expects
+// Convert Bubble's varying keys → stable keys our child device expects
 private Map normalizeStatus(Map raw) {
     Map out = [:]
     if (!raw) return out
@@ -614,7 +716,6 @@ private Map normalizeStatus(Map raw) {
     return out.findAll { k, v -> v != null }  // drop nulls
 }
 
-
 /* ============================== POLLING ============================== */
 
 def pollStatus() {
@@ -640,7 +741,7 @@ def pollStatus() {
         body: body ?: [:]
     ]
 
-    if (enableDebugLogging) log.debug "📥 Polling ha_therm_status @ ${url} (hvac=${state.sfpHvacName ?: '(none)'})"
+    if (enableDebugLogging) log.debug "Polling ha_therm_status @ ${url} (hvac=${state.sfpHvacName ?: '(none)'})"
 
     try {
         httpPost(params) { resp ->
@@ -657,13 +758,14 @@ def pollStatus() {
 
                 Map normalized = normalizeStatus(b ?: [:])
 
-                // Add current reachability to status payload for dashboard convenience
+                // OPTIONAL: expose driver-reported reachability and computed isReachable on the status view
                 try {
-                    String userId = state.sfpUserId
-                    String devId  = settings.thermostat?.getId()?.toString()
-                    if (userId && devId) {
-                        Boolean isReach = (state[_kReachable(userId, devId)] as Boolean)
-                        if (isReach != null) normalized.isReachable = isReach
+                    def t = settings.thermostat
+                    if (t) {
+                        normalized.deviceWatch  = t.currentValue("DeviceWatch-DeviceStatus")
+                        normalized.healthStatus = t.currentValue("healthStatus")
+                        normalized.presence     = t.currentValue("presence")
+                        normalized.isReachable  = _computeIsReachable(state.sfpUserId, t.getId().toString())
                     }
                 } catch (ignored) {}
 
@@ -674,7 +776,7 @@ def pollStatus() {
                     if (state.sfpLastStatus.isEmpty()) {
                         log.debug "Poll OK but empty payload. Keys: ${js?.keySet()}"
                     } else {
-                        log.debug "✅ Poll OK; keys=${state.sfpLastStatus.keySet()}"
+                        log.debug "Poll OK; keys=${state.sfpLastStatus.keySet()}"
                     }
                 }
             } else if (resp.status == 401) {
@@ -709,17 +811,19 @@ def scheduleCleanup() {
     }
 }
 
+// FIXED: Improved cleanup with orphaned state handling
 def cleanupOldSessions() {
     int maxRuntimeMs = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600000
     long cutoff = now() - maxRuntimeMs
     List keysToRemove = []
     int activeSessionsCount = 0
 
+    // Clean up old sessions
     state.each { k, v ->
         if (k.startsWith("sessionStart_")) {
             if (v && (v as Long) < cutoff) {
                 keysToRemove << k
-                if (enableDebugLogging) log.debug "🧹 Cleaning old session: ${k}"
+                if (enableDebugLogging) log.debug "Cleaning old session: ${k}"
             } else if (v) {
                 activeSessionsCount++
             }
@@ -733,14 +837,39 @@ def cleanupOldSessions() {
         state.remove("sessionLast_${deviceKey}") // also clear last snapshot if stale
     }
 
+    // Clean up orphaned wasActive states for devices that no longer exist
+    if (settings.thermostat) {
+        String currentDeviceId = settings.thermostat.getId()?.toString()
+        String currentUserId = state.sfpUserId
+        
+        if (currentDeviceId && currentUserId) {
+            String currentKey = "${currentUserId}-${currentDeviceId}"
+            List orphanedKeys = []
+            
+            state.each { k, v ->
+                if (k.startsWith("wasActive_") || k.startsWith("sessionLast_") || k.startsWith("isReachable_") || k.startsWith("lastSeen_")) {
+                    String keyDevice = k.split("_", 2)[1]
+                    if (keyDevice != currentKey) {
+                        orphanedKeys << k
+                    }
+                }
+            }
+            
+            orphanedKeys.each { state.remove(it) }
+            if (orphanedKeys.size() > 0 && enableDebugLogging) {
+                log.debug "Cleaned ${orphanedKeys.size()} orphaned state keys"
+            }
+        }
+    }
+
     if (keysToRemove.size() > 0 && enableDebugLogging) {
-        log.debug "🧹 Cleaned ${keysToRemove.size()} old sessions; ${activeSessionsCount} active remain"
+        log.debug "Cleaned ${keysToRemove.size()} old sessions; ${activeSessionsCount} active remain"
     }
 }
 
 def logSessionStats() {
     def stats = getSessionStats()
-    log.info "📊 Session Stats: ${stats.activeSessions} active, ${stats.totalDevices} total devices, oldest: ${stats.oldestSessionMinutes} min"
+    log.info "Session Stats: ${stats.activeSessions} active, ${stats.totalDevices} total devices, oldest: ${stats.oldestSessionMinutes} min"
 }
 
 def getSessionStats() {
@@ -760,7 +889,7 @@ def getSessionStats() {
 
     long oldestAgeMin = activeSessions > 0 ? Math.round((now() - oldest) / 1000 / 60) : 0
     if (enableDebugLogging) {
-        log.debug "📊 Stats: active=${activeSessions}, total=${totalDevices}, oldest=${oldestAgeMin} min"
+        log.debug "Stats: active=${activeSessions}, total=${totalDevices}, oldest=${oldestAgeMin} min"
     }
     return [activeSessions: activeSessions, totalDevices: totalDevices, oldestSessionMinutes: oldestAgeMin]
 }
@@ -768,10 +897,11 @@ def getSessionStats() {
 def resetAllDeviceSessions() {
     List keysToRemove = []
     state.each { k, v ->
-        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_") || k.startsWith("sessionLast_")) keysToRemove << k
+        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_") || k.startsWith("sessionLast_") ||
+            k.startsWith("isReachable_") || k.startsWith("lastSeen_")) keysToRemove << k
     }
     keysToRemove.each { state.remove(it) }
-    log.warn "🔄 RESET: Cleared ${keysToRemove.size()} session-tracking entries"
+    log.warn "RESET: Cleared ${keysToRemove.size()} session-tracking entries"
 }
 
 /* ============================== AUTH HELPERS ============================== */
@@ -804,7 +934,7 @@ private boolean _ensureValidTokenSkew() {
     if (!exp) return true
     Long nowSec = (now() / 1000L) as Long
     if (nowSec >= (exp - TOKEN_SKEW_SECONDS)) {
-        if (enableDebugLogging) log.debug "🔁 Pre-refreshing token (skew). now=${nowSec}, exp=${exp}"
+        if (enableDebugLogging) log.debug "Pre-refreshing token (skew). now=${nowSec}, exp=${exp}"
         return _refreshToken()
     }
     return true
@@ -847,7 +977,7 @@ private boolean _refreshToken() {
             state.sfpAccessToken  = at
             state.sfpRefreshToken = nrt
             state.sfpExpiresAt    = exp
-            if (enableDebugLogging) log.debug "🔁 Token refreshed; exp=${exp}"
+            if (enableDebugLogging) log.debug "Token refreshed; exp=${exp}"
             return true
         } else {
             log.warn "Refresh response missing access_token/expires_at: ${body}"
@@ -878,7 +1008,7 @@ private void _authorizedPost(String url, Map payload) {
     ]
 
     if (enableDebugLogging) {
-        log.debug "📤 POST ${url}"
+        log.debug "POST ${url}"
         log.debug "Payload: ${payload}"
     }
 
@@ -893,7 +1023,7 @@ private void _authorizedPost(String url, Map payload) {
                         httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
                     }
                 } else {
-                    if (enableDebugLogging) log.debug "✅ Telemetry OK (${resp.status})"
+                    if (enableDebugLogging) log.debug "Telemetry OK (${resp.status})"
                 }
             } else if (resp.status == 401) {
                 if (_refreshToken()) {
@@ -950,10 +1080,15 @@ private void updateStatusChild(Map payload) {
     if (total != null) d.sendEvent(name:"totalMinutes",   value: total)
     if (name)          d.sendEvent(name:"deviceName",     value: name)
 
+    // Optional: surface reachability signals on the status child as attributes too
+    if (payload.isReachable != null) d.sendEvent(name:"isReachable", value: payload.isReachable)
+    if (payload.deviceWatch  != null) d.sendEvent(name:"deviceWatch", value: payload.deviceWatch)
+    if (payload.healthStatus != null) d.sendEvent(name:"healthStatus", value: payload.healthStatus)
+    if (payload.presence     != null) d.sendEvent(name:"presence", value: payload.presence)
+
     d.sendEvent(name:"lastUpdated",
         value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
 }
-
 
 // called by the Reset child driver
 def resetNow() {
@@ -1005,4 +1140,27 @@ private String appEndpointBase() {
 private void logLink(String pathWithQuery) {
     def full = "${appEndpointBase()}${pathWithQuery}"
     log.info "SmartFilterPro link → ${full}"
+}
+
+/* ============================== CONNECTIVITY SCAN ============================== */
+
+// Respect explicit attributes if present; only use staleness if none exist
+def checkConnectivity() {
+    if (!settings.thermostat || !state.sfpUserId) return
+    String userId = state.sfpUserId
+    String devId  = settings.thermostat?.getId()?.toString()
+    if (!devId) return
+
+    // If the driver exposes a live reachability attribute, don't override it with staleness
+    def t = settings.thermostat
+    boolean hasExplicit =
+        (t?.getSupportedAttributes()?.any { it?.name == "DeviceWatch-DeviceStatus" }) ||
+        (t?.getSupportedAttributes()?.any { it?.name == "healthStatus" }) ||
+        (t?.getSupportedAttributes()?.any { it?.name == "presence" })
+
+    if (hasExplicit) return  // attribute will drive state via handleReachabilityEvent
+
+    Long nowMs  = now()
+    Long staleMs = ((settings.reachabilityStaleMinutes ?: DEFAULT_STALE_MINUTES) as Integer) * 60_000L
+    _maybeMarkUnreachableIfStale(userId, devId, nowMs, staleMs)
 }
