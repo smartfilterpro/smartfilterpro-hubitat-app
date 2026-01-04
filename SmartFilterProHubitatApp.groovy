@@ -1,49 +1,45 @@
 /**
- *  SmartFilterPro Thermostat Bridge (Hubitat)
- *  - Link with email/password → Bubble returns access_token/refresh_token/user_id/hvac(s)
- *  - Auto-refresh tokens on real 401s OR Bubble "soft 401"
- *  - Pre-emptive (skew) refresh before expiry
- *  - Optional local thermostat selection (skip allowed)
- *  - Poll ha_therm_status every 20 minutes
- *  - Expose Reset button + Status as child devices for Hubitat Dashboard
- *  - Status page with last payload
- *  - ADDED: isReachable (DeviceWatch/health/presence aware), ConnectivityStatusChanged, last* snapshot on session end
- *  - FIXED: Runtime calculation logic and session management race conditions
+ * SmartFilterPro Thermostat Bridge (Hubitat) — 8-State System (2025-10-18)
+ *   - Posts runtime and telemetry directly to Core with Bubble-issued JWT
+ *   - 8-State classification: Cooling_Fan, Cooling, Heating_Fan, Heating, AuxHeat_Fan, AuxHeat, Fan_only, Fan_off
+ *   - Automatically refreshes core_token if Core returns 401
  *
- *  © 2025 Eric Hanfman — Apache 2.0
+ * Key Changes:
+ *   - Updated state classification to 8-state system
+ *   - Maps boolean flags for heating/cooling/fan states
+ *   - Uses eventType for equipment_status field
+ *   - Tracks auxiliary heat separately
+ *
+ * © 2025 Eric Hanfman — Apache 2.0
  */
 
 import groovy.transform.Field
 
 /* ============================== CONSTANTS ============================== */
 
-@Field static final String DEFAULT_LOGIN_URL     = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_password_login"
-// MUST be lowercase 'hubitat' per requirement
-@Field static final String DEFAULT_TELEMETRY_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat"
-@Field static final String DEFAULT_STATUS_URL    = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_therm_status"
-@Field static final String DEFAULT_RESET_URL     = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_reset_filter"
-@Field static final String DEFAULT_REFRESH_URL   = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_refresh_token"
+@Field static final String CORE_INGEST_URL = "https://core-ingest-ingest.up.railway.app/ingest/v1/events:batch"
+@Field static final String BUBBLE_LOGIN_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_password_login"
+@Field static final String BUBBLE_REFRESH_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_refresh_token"
+@Field static final String BUBBLE_CORE_JWT_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/issue_core_token"
+@Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_therm_status"
+@Field static final String BUBBLE_RESET_URL = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/ha_reset_filter"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
-@Field static final Integer TOKEN_SKEW_SECONDS  = 60
-
-@Field static final Set ACTIVE_STATES = ["heating","cooling","fan only"] as Set
-
-// ADDED: Connectivity defaults
-@Field static final Integer DEFAULT_STALE_MINUTES = 15
-@Field static final Integer DEFAULT_SCAN_MINUTES  = 1
+@Field static final Integer TOKEN_SKEW_SECONDS = 60
 
 /* ============================== METADATA ============================== */
 
-definition (
-    name: "SmartFilterPro Thermostat Bridge",
+definition(
+    name: "SmartFilterPro Thermostat Bridge (8-State)",
     namespace: "smartfilterpro",
     author: "Eric Hanfman",
-    description: "Sends thermostat state & runtime to SmartFilterPro (Bubble) and polls status.",
+    description: "Tracks thermostat runtime with 8-state system & posts directly to Core with JWT.",
     category: "Convenience",
     iconUrl: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg",
     iconX2Url: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg"
 )
+
+/* ============================== PREFERENCES ============================== */
 
 preferences {
     page name: "mainPage"
@@ -52,1115 +48,722 @@ preferences {
     page name: "statusPage"
 }
 
-/* ============================== UI PAGES ============================== */
+/* ============================== MAIN PAGE ============================== */
 
 def mainPage() {
-    dynamicPage(name: "mainPage", title: "SmartFilterPro", install: true, uninstall: true) {
+    dynamicPage(name: "mainPage", title: "SmartFilterPro (8-State)", install: true, uninstall: true) {
         section("Hubitat Thermostat (optional)") {
             input "thermostat", "capability.thermostat",
-                title: "Select Thermostat (optional)", required: false, submitOnChange: true
-            paragraph "If skipped, telemetry from Hubitat is disabled. Cloud polling still works."
+                  title: "Select Thermostat (optional)", required: false, submitOnChange: true
         }
 
         section("Account Link") {
             if (state.sfpAccessToken && state.sfpUserId) {
                 String hvName = state.sfpHvacName ?: "(not selected)"
-                paragraph "Linked ✅  Thermostat: ${hvName}"
-                href name: "relinkHref", title: "Re-link / Switch HVAC", page: "linkPage",
+                paragraph "Linked ✅ Thermostat: ${hvName}"
+                href "linkPage", title: "Re-link / Switch HVAC",
                      description: "Update account or choose a different HVAC"
             } else {
-                input "loginEmail",    "email",    title: "Email",    required: true,  submitOnChange: true
-                input "loginPassword", "password", title: "Password", required: true,  submitOnChange: true
-
-                def linkUrl = "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
-                logLink("/login?access_token=${getOrCreateAppToken()}")
-                href name: "doLoginInline", title: "Link Account",
-                     style: "external", description: "Tap to authenticate now (opens new tab)",
-                     url: linkUrl, state: "complete"
-
-                if (state.lastLoginError) paragraph "Last error: ${state.lastLoginError}"
-                href name: "openLinkPage", title: "Open linking sub-page",
-                     page: "linkPage", description: "Alternative linking flow"
+                input "loginEmail",    "email",    title: "Email",    required: true
+                input "loginPassword", "password", title: "Password", required: true
+                href "linkPage", title: "Link Account",
+                     description: "Authenticate and select HVAC"
             }
         }
 
         section("Options") {
             input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true
-            input "enableRetryLogic", "bool", title: "Enable HTTP Retry Logic", defaultValue: true
             input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
                  defaultValue: DEFAULT_HTTP_TIMEOUT, range: "5..120"
         }
 
-        section("Runtime Tracking") {
-            input "maxRuntimeHours", "number",
-                title: "Maximum Runtime Hours (cap a single session)",
-                defaultValue: 24, range: "1..168"
-        }
-
-        section("Connectivity (Reachability)") {
-            input "reachabilityStaleMinutes", "number",
-                title: "Mark device unreachable after N minutes without any events",
-                defaultValue: DEFAULT_STALE_MINUTES, range: "1..180"
-            input "connectivityScanMinutes", "number",
-                title: "Scan frequency (minutes)",
-                defaultValue: DEFAULT_SCAN_MINUTES, range: "1..30"
-            input "publishConnectivity", "bool",
-                title: "Send ConnectivityStatusChanged events to Bubble",
-                defaultValue: true
-        }
-
-        section("Session Maintenance & Stats") {
-            input "cleanupFrequency", "enum", title: "Cleanup Frequency",
-                defaultValue: "1 Hour",
-                options: ["30 Minutes","1 Hour","2 Hours","6 Hours","12 Hours"]
-            input "enableSessionStats", "bool", title: "Log Session Stats Every 15 Minutes", defaultValue: false
-            input "resetAllSessions", "bool", title: "Reset All Sessions on Save", defaultValue: false
-        }
-
         section("Status") {
-            href name: "statusHref", title: "View Last Polled Status",
-                 page: "statusPage", description: "Shows the last ha_therm_status payload"
+            href "statusPage", title: "View Last Bubble Status (20min poll)",
+                 description: "Shows last ha_therm_status from Bubble"
         }
     }
 }
 
+/* ============================== LINK / HVAC SELECTION ============================== */
+
 def linkPage() {
     dynamicPage(name: "linkPage", title: "Link SmartFilterPro", install: false, uninstall: false) {
         section("Sign In") {
-            input "loginEmail",    "email",    title: "Email",    required: true, submitOnChange: true
-            input "loginPassword", "password", title: "Password", required: true, submitOnChange: true
-
-            def linkUrl = "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
-            logLink("/login?access_token=${getOrCreateAppToken()}")
-            href name: "doLogin", title: "Link Account",
-                 style: "external", description: "Tap to authenticate now (opens new tab)",
-                 url: linkUrl, state: "complete"
-
-            paragraph "After tapping, return to this page. If you have multiple thermostats, you'll get a 'Select HVAC' link."
+            input "loginEmail", "email", title: "Email", required: true
+            input "loginPassword", "password", title: "Password", required: true
+            href name: "doLogin", title: "Authenticate", style: "external",
+                 description: "Tap to log in (opens new tab)",
+                 url: "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
         }
 
-        if (state.lastLoginError) {
+        if (state.lastLoginError)
             section("Last Error") { paragraph "${state.lastLoginError}" }
-        }
 
-        if (state.sfpHvacChoices && (state.sfpHvacChoices as Map).size() > 1 && !state.sfpHvacId) {
-            href name: "pickHvac", title: "Select HVAC", page: "selectHvacPage",
+        if (state.sfpHvacChoices && (state.sfpHvacChoices as Map).size() > 1 && !state.sfpHvacId)
+            href "selectHvacPage", title: "Select HVAC",
                  description: "Multiple thermostats found. Pick one."
-        }
-
-        if (state.sfpAccessToken && state.sfpUserId) {
-            section("Linked") {
-                paragraph "Account linked."
-            }
-        }
     }
 }
 
 def selectHvacPage() {
     dynamicPage(name: "selectHvacPage", title: "Select HVAC", install: false, uninstall: false) {
-        Map opts = (state.sfpHvacChoices ?: [:])    // id -> label (name)
+        Map opts = (state.sfpHvacChoices ?: [:])
         input "chosenHvac", "enum", title: "Thermostat", required: true,
               options: opts, submitOnChange: true
         if (settings.chosenHvac) {
-            String id    = settings.chosenHvac.toString()
-            String label = (state.sfpHvacChoices ?: [:])[id] ?: id
-            paragraph "Selected: ${label}"
-            def saveUrl = "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
-            logLink("/chooseHvac?access_token=${getOrCreateAppToken()}&id=${id}")
-            href name: "saveHvacHref", title: "Save Selection",
-                 style: "external", url: saveUrl, description: "Tap to save"
+            String id = settings.chosenHvac.toString()
+            paragraph "Selected: ${opts[id] ?: id}"
+            href "chooseHvac", title: "Save Selection",
+                 style: "external",
+                 url: "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
         }
     }
 }
 
 def statusPage() {
     Map shown = state.sfpLastStatus ?: [:]
-    if (shown.isEmpty() && state.sfpLastEnvelope) {
-        shown = [note: "Payload was empty; showing envelope for debug.", envelope: state.sfpLastEnvelope]
-    }
-    def jsonPretty = groovy.json.JsonOutput.prettyPrint(
-        groovy.json.JsonOutput.toJson(shown)
-    )
-    dynamicPage(name: "statusPage", title: "Last Polled ha_therm_status", install: false, uninstall: false) {
-        section("Payload") {
+    def jsonPretty = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(shown))
+    dynamicPage(name: "statusPage", title: "Last Bubble Status (Polled)", install: false, uninstall: false) {
+        section("Polled from ha_therm_status") {
             paragraph "<pre>${jsonPretty}</pre>"
+        }
+        section("Info") {
+            paragraph "This data is polled every 20 minutes from Bubble's ha_therm_status endpoint"
         }
     }
 }
 
-/* ============================== CLOUD/LOCAL ENDPOINTS ============================== */
+/* ============================== MAPPINGS ============================== */
 
 mappings {
     path("/login")      { action: [ GET: "cloudLogin" ] }
     path("/chooseHvac") { action: [ GET: "cloudChooseHvac" ] }
-    path("/status")     { action: [ GET: "cloudShowStatus" ] }
 }
 
-/** Called by Link Account — POSTs to Bubble login and stores results. */
-def cloudLogin() {
-    state.lastLoginError = null
-    try {
-        def email = (settings.loginEmail ?: "").toString().trim()
-        def pwd   = (settings.loginPassword ?: "").toString()
+/* ============================== UTILITIES ============================== */
 
-        if (!email || !pwd) {
-            state.lastLoginError = "Email and Password are required. Return to the app, enter them, then tap Link Account again."
-            return render(contentType: "text/html",
-                data: """<html><body><h3>Missing email/password. Close this tab and return to the app.</h3></body></html>"""
-            )
+private String hubUidSafe() {
+    try { return getHubUID() } catch (e) { return location?.hubs?.first()?.id }
+}
+private String appEndpointBase() {
+    String base = getApiServerUrl() ?: ""
+    if (base.startsWith("https://cloud.hubitat.com"))
+        return "https://cloud.hubitat.com/api/${hubUidSafe()}/apps/${app.id}"
+    return "${base}/apps/api/${app.id}"
+}
+private String getOrCreateAppToken() {
+    if (!state.appAccessToken) { createAccessToken(); state.appAccessToken = state.accessToken }
+    return state.appAccessToken
+}
+
+private boolean checkDeviceReachable(def dev) {
+    try {
+        // Method 1: Check device health status (if available)
+        def healthStatus = dev.getStatus()
+        if (healthStatus && healthStatus.toLowerCase() == "offline") {
+            if (enableDebugLogging) log.debug "Device ${dev.displayName} is offline"
+            return false
         }
 
-        String url = DEFAULT_LOGIN_URL
-        Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
+        // Method 2: Check if device has recent activity (within last 2 hours)
+        def lastActivity = dev.getLastActivity()
+        if (lastActivity) {
+            long lastActivityMs = lastActivity.time
+            long twoHoursAgo = now() - (2 * 60 * 60 * 1000)
+            if (lastActivityMs < twoHoursAgo) {
+                if (enableDebugLogging) log.debug "Device ${dev.displayName} hasn't reported in 2+ hours"
+                return false
+            }
+        }
+        
+        // Method 3: Check if critical attributes are null (might indicate offline)
+        def temp = dev.currentTemperature
+        def state = dev.currentThermostatOperatingState
+        if (temp == null && state == null) {
+            if (enableDebugLogging) log.warn "Device ${dev.displayName} has null critical attributes"
+            return false
+        }
+        
+        // If all checks pass, device is reachable
+        return true
+        
+    } catch (Exception e) {
+        log.warn "Error checking device reachability: ${e.message}"
+        // Default to true if we can't determine status
+        return true
+    }
+}
+
+/* ============================== LOGIN / HVAC ============================== */
+
+def cloudLogin() {
+    try {
+        def email = settings.loginEmail?.trim()
+        def pwd = settings.loginPassword
+        if (!email || !pwd) return _html("Missing credentials.")
 
         Map loginResp
         httpPost([
-            uri: url,
+            uri: BUBBLE_LOGIN_URL,
             contentType: "application/json",
-            requestContentType: "application/json",
-            timeout: timeoutSec,
-            body: [ email: email, password: pwd ]
-        ]) { resp ->
-            loginResp = (resp.data instanceof Map) ? resp.data : [:]
-        }
+            body: [ email: email, password: pwd ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> loginResp = resp.data }
 
-        def body = _bubbleBody(loginResp)
+        Map body = _bubbleBody(loginResp)
+        if (!body.access_token) return _html("Login failed.")
 
-        String access  = (body?.access_token ?: body?.token ?: "").toString()
-        String refresh = (body?.refresh_token ?: body?.rtoken ?: "").toString()
-        Long   expires = null
-        try { expires = (body?.expires_at as Long) } catch (e) { expires = null }
-        if (!expires && body?.expires) {
-            try { expires = ((now() / 1000L) as Long) + ((body.expires as Long) as Long) } catch (e) {}
-        }
-        String userId = (body?.user_id ?: "").toString()
+        state.sfpAccessToken  = body.access_token
+        state.sfpRefreshToken = body.refresh_token
+        state.sfpUserId       = body.user_id
+        state.sfpCoreToken    = body.core_token
+        state.sfpCoreTokenExp = body.expires_at
 
-        /* ---------- Build name-aware choices ---------- */
-        List ids = []
-        def idRaw = body?.hvac_id
-        if (idRaw instanceof List) { ids.addAll(idRaw) }
-        else if (idRaw) { ids << idRaw }
-        if (body?.hvac_ids instanceof List) {
-            body.hvac_ids.each { if (it) ids << it }
-        }
-        ids = ids.collect { it?.toString() }.findAll { it }.unique()
-
-        List names = (body?.hvac_name instanceof List) ?
-            body.hvac_name.collect { it?.toString() } : []
-
-        Map choices    = [:]  // id -> label shown to user (prefer name)
-        Map namesById  = [:]  // id -> raw name
-        ids.eachWithIndex { String id, int idx ->
-            String nm = (idx < names.size() && names[idx]) ? names[idx] : ""
-            choices[id]   = nm ?: id
-            namesById[id] = nm
-        }
+        // HVAC map
+        Map choices = [:]
+        List ids = body.hvac_id instanceof List ? body.hvac_id : [body.hvac_id]
+        List names = body.hvac_name instanceof List ? body.hvac_name : []
+        ids.eachWithIndex { id, idx -> if (id) choices[id] = names[idx] ?: id }
         state.sfpHvacChoices = choices
-        state.sfpHvacNames   = namesById
-
-        if (!access || !userId) {
-            state.lastLoginError = "Login response missing access_token or user_id."
-        } else if (_isBubbleSoft401(body)) {
-            state.lastLoginError = "Login returned invalid_token — check credentials."
-        } else {
-            state.sfpAccessToken  = access
-            state.sfpRefreshToken = refresh
-            state.sfpExpiresAt    = expires   // epoch seconds
-            state.sfpUserId       = userId
-
-            if (choices.size() == 1) {
-                String onlyId = choices.keySet().asList()[0]
-                state.sfpHvacId   = onlyId
-                state.sfpHvacName = namesById[onlyId] ?: choices[onlyId]
-            } else if (choices.size() > 1) {
-                state.sfpHvacId   = null
-                state.sfpHvacName = null
-            }
-
-            // Clear sensitive input after use
-            app.updateSetting("loginPassword", [type: "password", value: ""])
+        if (choices.size() == 1) {
+            state.sfpHvacId = choices.keySet().first()
+            state.sfpHvacName = choices.values().first()
         }
-    } catch (e) {
-        state.lastLoginError = "Login failed: ${e}"
-        log.error "SmartFilterPro login failed: ${e}"
-    }
 
-    render(contentType: "text/html",
-        data: """<html><body><h3>Login processed. Close this tab and return to the app.</h3></body></html>"""
-    )
+        app.updateSetting("loginPassword", [type:"password", value:""])
+        _html("Login complete. Close this tab and return to the app.")
+    } catch (e) {
+        log.error "Login error: ${e}"
+        _html("Login failed: ${e}")
+    }
 }
 
-/** Saves the selected HVAC id and its name. */
 def cloudChooseHvac() {
     def id = params?.id?.toString()
     if (id) {
         state.sfpHvacId = URLDecoder.decode(id, "UTF-8")
-        String lbl = (state.sfpHvacNames ?: [:])[state.sfpHvacId] ?: (state.sfpHvacChoices ?: [:])[state.sfpHvacId]
-        state.sfpHvacName = (lbl ?: "").toString()
+        state.sfpHvacName = (state.sfpHvacChoices ?: [:])[state.sfpHvacId]
     }
-    render(contentType: "text/html",
-        data: """<html><body><h3>Saved. Close this tab and return to the app.</h3></body></html>"""
-    )
+    _html("Saved HVAC. Close this tab and return.")
 }
 
-/** Show last polled status (pretty JSON). */
-def cloudShowStatus() {
-    def jsonPretty = groovy.json.JsonOutput.prettyPrint(
-        groovy.json.JsonOutput.toJson(state.sfpLastStatus ?: [:])
-    )
-    render(contentType: "text/html",
-        data: """<html><body><pre>${jsonPretty}</pre></body></html>"""
-    )
+private def _html(String msg) {
+    render(contentType: "text/html", data: "<html><body><h3>${msg}</h3></body></html>")
+}
+
+private Map _bubbleBody(Map resp) {
+    return (resp?.response ?: resp) as Map
 }
 
 /* ============================== LIFECYCLE ============================== */
 
 def installed() {
-    log.info "SmartFilterPro Thermostat Bridge installed"
-    ensureChildren()
+    log.info "SmartFilterPro Bridge installed"
     initialize()
 }
 
-def updated() {
-    log.info "SmartFilterPro Thermostat Bridge updated"
+def updated()  {
+    log.info "SmartFilterPro Bridge updated"
     unsubscribe()
     unschedule()
-    ensureChildren()
-
-    if (settings.resetAllSessions) {
-        resetAllDeviceSessions()
-        app.updateSetting("resetAllSessions", [value:false, type:"bool"])
-    }
-
     initialize()
 }
 
 def initialize() {
-    if (settings.thermostat) {
-        subscribe(settings.thermostat, "thermostatOperatingState", handleEvent)
-        subscribe(settings.thermostat, "temperature",               handleEvent)
+    log.info "🔧 Initializing SmartFilterPro Bridge (8-State System)…"
 
-        // NEW: explicit reachability signals
-        subscribe(settings.thermostat, "DeviceWatch-DeviceStatus",  handleReachabilityEvent)
-        subscribe(settings.thermostat, "healthStatus",              handleReachabilityEvent)   // "online"/"offline"
-        subscribe(settings.thermostat, "presence",                  handleReachabilityEvent)   // "present"/"not present"
+    if (settings.thermostat) {
+        log.info "📡 Subscribing to thermostat: ${settings.thermostat.displayName} (ID: ${settings.thermostat.getId()})"
+        subscribe(settings.thermostat, "thermostatOperatingState", handleEvent)
+        subscribe(settings.thermostat, "temperature", handleEvent)
+        subscribe(settings.thermostat, "thermostatFanMode", handleEvent)
+        subscribe(settings.thermostat, "humidity", handleEvent)
+        subscribe(settings.thermostat, "heatingSetpoint", handleEvent)
+        subscribe(settings.thermostat, "coolingSetpoint", handleEvent)
+        subscribe(settings.thermostat, "thermostatMode", handleEvent)
+        log.info "✅ Subscriptions created"
     } else {
-        if (enableDebugLogging) log.debug "No Hubitat thermostat selected; telemetry disabled."
+        log.warn "⚠️ No thermostat selected - skipping subscriptions"
     }
 
     unschedule()
-    schedule("0 0/20 * * * ?", "pollStatus")
-    runIn(5, "pollStatus")
+    runEvery30Minutes("heartbeat")
+    runEvery5Minutes("checkDeviceHealth")
 
-    // Connectivity scanner
-    Integer scanMins  = ((settings.connectivityScanMinutes ?: DEFAULT_SCAN_MINUTES) as Integer)
-    schedule("0 0/${scanMins} * * * ?", "checkConnectivity")
+    schedule("0 0/20 * * * ?", "pollBubbleStatus")
+    runIn(5, "pollBubbleStatus")
 
-    scheduleCleanup()
-    if (settings.enableSessionStats) runEvery15Minutes(logSessionStats)
-
-    log.info "Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'}"
+    log.info "✅ Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'} | User=${state.sfpUserId ?: '(none)'}"
 }
 
-/* ============================== TELEMETRY ============================== */
-
-// ---------- ADDED helpers: normalization & connectivity ----------
-
-// Normalize Hubitat operating state → heating|cooling|fanonly|idle|unknown
-private String _normOp(def op) {
-    String s = op?.toString()?.toLowerCase() ?: ""
-    if (s.contains("cool")) return "cooling"
-    if (s.contains("heat")) return "heating"
-    if (s.contains("fan"))  return "fanonly"
-    if (s.contains("idle") || s == "off") return "idle"
-    return "unknown"
+def heartbeat() {
+    if (enableDebugLogging)
+        log.debug "💓 Heartbeat — linked=${!!state.sfpAccessToken}, hvac=${state.sfpHvacId ?: '(none)'}"
 }
 
-// Per-device state keys
-private String _kSessionStart(String userId, String devId) { "sessionStart_${userId}-${devId}" }
-private String _kWasActive(String userId, String devId)  { "wasActive_${userId}-${devId}" }
-private String _kSessionLast(String userId, String devId){ "sessionLast_${userId}-${devId}" }
-private String _kReachable(String userId, String devId)  { "isReachable_${userId}-${devId}" }
-private String _kLastSeen(String userId, String devId)   { "lastSeen_${userId}-${devId}" }
+def checkDeviceHealth() {
+    if (!settings.thermostat) return
 
-// Connectivity: mark seen (reachable) and optionally post flip event
-private void _markSeen(String userId, String devId) {
-    String kR = _kReachable(userId, devId)
-    String kS = _kLastSeen(userId, devId)
-    Boolean was = (state[kR] as Boolean)
-    state[kS] = now()
-    state[kR] = true
-    if (publishConnectivity && was == false) {
-        _postConnectivityChange(true, userId, devId, "event_seen")
+    boolean wasReachable = state.lastKnownReachable ?: true
+    boolean isReachable = checkDeviceReachable(settings.thermostat)
+
+    // Only send update if reachability status changed
+    if (wasReachable != isReachable) {
+        log.warn "⚠️ Device reachability changed: ${wasReachable} → ${isReachable}"
+        state.lastKnownReachable = isReachable
+        
+        // Send a status update to Core
+        if (state.sfpAccessToken) {
+            String op = settings.thermostat.currentThermostatOperatingState ?: "idle"
+            String fanMode = settings.thermostat.currentThermostatFanMode ?: "auto"
+            String equipmentStatus = classifyState(op, fanMode, false)
+            
+            Map payload = buildCoreEventFromDevice(
+                settings.thermostat, 
+                "Telemetry_Update",  // ✅ Event type (what kind of event)
+                null, 
+                equipmentStatus,     // ✅ Equipment status (what equipment is doing)
+                isReachable
+            )
+            _postToCoreWithJwt(payload)
+        }
     }
 }
 
-// Connectivity: maybe mark unreachable if stale
-private boolean _maybeMarkUnreachableIfStale(String userId, String devId, Long nowMs, Long staleMs) {
-    String kR = _kReachable(userId, devId)
-    String kS = _kLastSeen(userId, devId)
-    Long last = (state[kS] as Long) ?: 0L
-    if ((nowMs - last) > staleMs && (state[kR] as Boolean) != false) {
-        state[kR] = false
-        if (publishConnectivity) _postConnectivityChange(false, userId, devId, "stale_timeout")
+/* ============================== 8-STATE CLASSIFICATION ============================== */
+
+/**
+ * /* ============================== 8-STATE CLASSIFICATION ============================== */
+
+/**
+ * Classify thermostat state using 8-state system:
+ * Cooling_Fan, Cooling, Heating_Fan, Heating, AuxHeat_Fan, AuxHeat, Fan_only, Idle
+ *
+ * Hubitat Logic:
+ *   - operatingState tells us what equipment is running
+ *   - fanMode tells us if fan is explicitly on
+ *   - Check for auxiliary/emergency heat
+ */
+private String classifyState(String operatingState, String fanMode, boolean checkAuxHeat = true) {
+    String op = (operatingState ?: "idle").toLowerCase()
+    String fan = (fanMode ?: "auto").toLowerCase()
+    
+    boolean coolingActive = op.contains("cool")
+    boolean heatingActive = op.contains("heat")
+    boolean fanExplicitlyOn = (fan in ["on", "circulate"])
+    boolean fanOnlyMode = (op == "fan only")
+    
+    // Check for auxiliary/emergency heat
+    // Hubitat may report this in operatingState or we check thermostatMode
+    boolean isAuxHeat = checkAuxHeat && (op.contains("emergency") || op.contains("aux"))
+    
+    if (isAuxHeat && fanExplicitlyOn) {
+        return "AuxHeat_Fan"
+    } else if (isAuxHeat) {
+        return "AuxHeat"
+    } else if (coolingActive && fanExplicitlyOn) {
+        return "Cooling_Fan"
+    } else if (coolingActive) {
+        return "Cooling"
+    } else if (heatingActive && fanExplicitlyOn) {
+        return "Heating_Fan"
+    } else if (heatingActive) {
+        return "Heating"
+    } else if (fanOnlyMode || fanExplicitlyOn) {
+        return "Fan_only"
+    } else {
+        return "Idle"  // ✅ Changed from "Fan_off" to "Idle"
+    }
+}
+
+/* ============================== RUNTIME / EVENTS ============================== */
+
+def handleEvent(evt) {
+    if (enableDebugLogging)
+        log.debug "🔔 Event received: ${evt.name} = ${evt.value} from ${evt.displayName}"
+
+    def dev = settings.thermostat
+    if (!dev) {
+        if (enableDebugLogging) log.warn "⚠️ handleEvent: No thermostat configured, skipping"
+        return
+    }
+
+    if (!state.sfpAccessToken) {
+        if (enableDebugLogging) log.warn "⚠️ handleEvent: Not linked (no access token), skipping"
+        return
+    }
+
+    String op = dev.currentThermostatOperatingState?.toLowerCase() ?: "idle"
+    String fanMode = dev.currentThermostatFanMode?.toLowerCase() ?: "auto"
+    String thermostatMode = dev.currentThermostatMode?.toLowerCase() ?: "auto"
+
+    boolean isStateChangingEvent = (evt.name in ["thermostatOperatingState", "thermostatFanMode"])
+
+    String uid = state.sfpUserId
+    String devId = dev.getId().toString()
+    String keyLastThermostatMode = "lastThermostatMode_${uid}-${devId}"
+    String lastThermostatMode = state[keyLastThermostatMode] ?: "auto"
+    boolean thermostatModeChanged = (thermostatMode != lastThermostatMode)
+
+    if (thermostatModeChanged && enableDebugLogging) {
+        log.debug "🔄 Thermostat mode changed: ${lastThermostatMode} → ${thermostatMode}"
+    }
+
+    // Classify current state using 8-state system
+    String equipmentStatus = classifyState(op, fanMode, true)
+    boolean isActive = (equipmentStatus != "Idle") 
+
+    if (enableDebugLogging) {
+        log.debug "📊 State: op=${op}, fanMode=${fanMode}, thermostatMode=${thermostatMode}, equipment_status=${equipmentStatus}, isActive=${isActive}, isStateChange=${isStateChangingEvent}"
+    }
+
+    String keyStart = "sessionStart_${uid}-${devId}"
+    String keyWas   = "wasActive_${uid}-${devId}"
+    String keyLastType = "lastEquipmentStatus_${uid}-${devId}"
+
+    boolean wasActive = (state[keyWas] as Boolean) ?: false
+    String lastEquipmentStatus = state[keyLastType] ?: "Idle"
+
+    boolean equipmentModeChanged = (equipmentStatus != lastEquipmentStatus)
+
+    // Handle thermostat mode change (environmental update)
+    if (thermostatModeChanged && !equipmentModeChanged && !isStateChangingEvent) {
+        if (enableDebugLogging) log.debug "📊 Thermostat mode changed (${lastThermostatMode} → ${thermostatMode})"
+
+        // ✅ Use "Mode_Change" for event_type, but current state for equipment_status
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+
+        state[keyLastThermostatMode] = thermostatMode
+
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // Handle environmental telemetry updates (no state change)
+    if (!isStateChangingEvent && !equipmentModeChanged) {
+        if (enableDebugLogging) log.debug "📊 Telemetry update (environmental change)"
+
+        // ✅ Use "Telemetry_Update" for event_type, but current state for equipment_status
+        Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // Calculate runtime if transitioning
+    Integer runtimeSeconds = null
+    if (equipmentModeChanged && wasActive && state[keyStart]) {
+        Long start = (state[keyStart] as Long)
+        if (start) {
+            runtimeSeconds = Math.max(0L, ((now() - start) / 1000L) as int)
+            if (enableDebugLogging) log.debug "⏱️ Runtime calculated: ${runtimeSeconds}s (was ${lastEquipmentStatus})"
+        }
+    }
+
+    // Session START (inactive → active)
+    if (isActive && !wasActive) {
+        state[keyStart] = now()
+        if (enableDebugLogging) log.debug "🏁 Session START: ${equipmentStatus}"
+        
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+        
+        state[keyWas] = true
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+        
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // Session END (active → inactive)
+    if (!isActive && wasActive) {
+        state.remove(keyStart)
+        if (enableDebugLogging) log.debug "🛑 Session END: ${lastEquipmentStatus} -> Idle (runtime=${runtimeSeconds}s)"
+        
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+        
+        state[keyWas] = false
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+        
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // Equipment mode changed while active (Heating → Cooling, etc.)
+    if (isActive && equipmentModeChanged) {
+        state[keyStart] = now()
+        if (enableDebugLogging) log.debug "🔄 Equipment mode switch: ${lastEquipmentStatus} → ${equipmentStatus} (runtime=${runtimeSeconds}s)"
+        
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+        
+        state[keyWas] = true
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+        
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // State-changing event while active (fan mode changed, etc.)
+    if (isActive && isStateChangingEvent && !equipmentModeChanged) {
+        if (enableDebugLogging) log.debug "🔄 State change: ${evt.name} changed to ${evt.value}"
+        
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+        
+        state[keyWas] = true
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+        
+        _postToCoreWithJwt(payload)
+        return
+    }
+
+    // State-changing event while inactive
+    if (!isActive && isStateChangingEvent && !equipmentModeChanged) {
+        if (enableDebugLogging) log.debug "🔄 State change while idle: ${evt.name} changed to ${evt.value}"
+        
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+        
+        state[keyWas] = false
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+        
+        _postToCoreWithJwt(payload)
+        return
+    }
+}
+/* ============================== PAYLOAD BUILDER - 8-STATE SYSTEM ============================== */
+
+private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeSeconds = null, String equipmentStatus = null, Boolean overrideIsActive = null) {
+    String userId = state.sfpUserId
+    String deviceId = dev.getId().toString()
+    String label = dev.label ?: dev.displayName ?: dev.name
+    String manufacturer = dev.getDataValue("manufacturer") ?: "Hubitat"
+    String model = dev.getDataValue("model") ?: "Unknown Model"
+    String modelNumber = dev.deviceNetworkId ?: "Unknown"
+    String op = dev.currentThermostatOperatingState
+    String thermostatMode = dev.currentThermostatMode
+    Double temp = dev.currentTemperature
+    Double heat = dev.currentHeatingSetpoint
+    Double cool = dev.currentCoolingSetpoint
+    Double humidity = dev.currentHumidity
+    def rawAttrs = [:]
+    dev.supportedAttributes.each { a -> rawAttrs[a.name] = dev.currentValue(a.name) }
+
+    // Check if device is reachable
+    boolean isReachable = checkDeviceReachable(dev)
+
+    String ts = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location?.timeZone ?: TimeZone.getTimeZone("UTC"))
+
+    // Use 8-state equipment status
+	String finalEquipStatus = equipmentStatus ?: eventType ?: "Idle"  // Changed from "Fan_off"
+	Boolean finalIsActive = (overrideIsActive != null) ? overrideIsActive : (eventType != "Idle")  // Changed from "Fan_off"
+
+    // Map 8-state system to boolean flags
+    boolean isCooling = (finalEquipStatus == "Cooling_Fan" || finalEquipStatus == "Cooling")
+    boolean isHeating = (finalEquipStatus == "Heating_Fan" || finalEquipStatus == "Heating" ||
+                        finalEquipStatus == "AuxHeat_Fan" || finalEquipStatus == "AuxHeat")
+    boolean isFanOnly = (finalEquipStatus == "Fan_only")
+
+    return [
+        device_key: state.sfpHvacId,
+        device_id: state.sfpHvacId,
+        workspace_id: userId,
+        user_id: userId,
+        device_name: label,
+        manufacturer: manufacturer,
+        model: model,
+        model_number: modelNumber,
+        device_type: "thermostat",
+        source: "hubitat",
+        source_vendor: "hubitat",
+        connection_source: "hubitat",
+        frontend_id: state.sfpHvacId,
+        firmware_version: dev.getDataValue("firmwareVersion"),
+        serial_number: dev.getDataValue("serialNumber"),
+        timezone: location?.timeZone?.ID ?: "UTC",
+        
+        // Use 8-state boolean flags
+        last_mode: thermostatMode,
+        thermostat_mode: thermostatMode,
+        last_is_cooling: isCooling,
+        last_is_heating: isHeating,
+        last_is_fan_only: isFanOnly,
+        last_equipment_status: finalEquipStatus,  // Use 8-state value
+        is_reachable: isReachable,
+        
+        last_temperature: temp,
+        temperature_f: temp,
+        humidity: humidity,
+        last_humidity: humidity,
+        last_heat_setpoint: heat,
+        heat_setpoint_f: heat,
+        last_cool_setpoint: cool,
+        cool_setpoint_f: cool,
+        
+        event_type: eventType,
+        equipment_status: finalEquipStatus,  // Use 8-state value
+        is_active: finalIsActive,
+        runtime_seconds: runtimeSeconds,
+        timestamp: ts,
+        recorded_at: ts,
+        observed_at: ts,
+        payload_raw: rawAttrs
+    ]
+}
+
+/* ============================== CORE POST / TOKEN ============================== */
+
+private boolean _postToCoreWithJwt(Object body) {
+    if (!_ensureCoreTokenValid()) {
+        log.warn "❌ No valid core_token available; skipping Core post"
+        return false
+    }
+    return _postToCoreAttempt(body, false)
+}
+
+private boolean _postToCoreAttempt(Object body, boolean isRetry) {
+    String token = state.sfpCoreToken ?: ""
+    Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
+
+    if (isRetry) log.info "🔄 RETRY: Attempting Core post with refreshed token..."
+
+    Map params = [
+        uri: CORE_INGEST_URL,
+        contentType: "application/json",
+        requestContentType: "application/json",
+        timeout: timeoutSec,
+        headers: [ Authorization: "Bearer ${token}" ],
+        body: body instanceof List ? body : [body]
+    ]
+
+    try {
+        httpPost(params) { resp ->
+            if (resp.status >= 200 && resp.status < 300) {
+                if (enableDebugLogging) log.debug "✅ Core OK (${resp.status})"
+                if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
+                return true
+            } else {
+                log.warn "⚠️ Core returned non-OK status: ${resp.status}"
+                return false
+            }
+        }
+        return true
+    } catch (Exception e) {
+        log.error "❌ Core post exception: ${e.message}"
+        
+        String errMsg = e.toString()
+        boolean is401 = errMsg.contains("401") || errMsg.toLowerCase().contains("unauthorized")
+        
+        if (is401 && !isRetry) {
+            log.warn "⚠️ Core 401 — refreshing token and retrying"
+            if (_issueCoreTokenOrLog()) {
+                return _postToCoreAttempt(body, true)
+            }
+        }
+        return false
+    }
+}
+
+private boolean _ensureCoreTokenValid() {
+    Long exp = (state.sfpCoreTokenExp as Long)
+    Long nowSec = (now() / 1000L) as Long
+
+    if (state.sfpCoreToken && exp && nowSec < (exp - TOKEN_SKEW_SECONDS)) {
+        if (enableDebugLogging) 
+            log.debug "✅ Core token valid (expires in ${exp - nowSec}s)"
         return true
     }
-    return false
+
+    if (enableDebugLogging)
+        log.debug "🔄 Core token expired, requesting new one..."
+
+    return _issueCoreTokenOrLog()
 }
 
-// POST minimal connectivity event
-private void _postConnectivityChange(boolean isReachable, String userId, String devId, String reason) {
-    def t = settings.thermostat
-    def payload = [
-        userId       : userId,
-        thermostatId : state.sfpHvacId,
-        hubitat_deviceId: devId,
-        deviceName   : (t?.displayName ?: t?.label ?: t?.name) ?: state.sfpHvacName,
-        eventType    : "ConnectivityStatusChanged",
-        isReachable  : isReachable,
-        ts           : new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX", location.timeZone),
-        reason       : reason
-    ]
-    _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
-    if (enableDebugLogging) log.debug "ConnectivityStatusChanged: ${devId} → ${isReachable} (${reason})"
-}
-
-// NEW: Handler for explicit reachability attributes
-def handleReachabilityEvent(evt) {
-    if (!settings.thermostat || !state.sfpUserId) return
-
-    String attr = (evt?.name ?: "").toString()
-    String val  = (evt?.value ?: "").toString()
-    if (enableDebugLogging) log.debug "Reachability attr=${attr} value=${val}"
-
-    String userId = state.sfpUserId
-    String devId  = settings.thermostat?.getId()?.toString()
-    if (!devId) return
-
-    boolean isUp = _coerceReachValue(val)
-    String kR = _kReachable(userId, devId)
-    String kS = _kLastSeen(userId, devId)
-    Boolean was = (state[kR] as Boolean)
-
-    state[kR] = isUp
-    state[kS] = now()  // also treat as "seen" for stale fallback
-
-    if (publishConnectivity && (was == null || was != isUp)) {
-        _postConnectivityChange(isUp, userId, devId, "attr:${attr}")
-    }
-}
-
-// Maps various attribute values to a boolean
-private boolean _coerceReachValue(def v) {
-    String s = v?.toString()?.trim()?.toLowerCase()
-    if (!s) return false
-    if (["online","present","true","1","up","reachable"].contains(s)) return true
-    if (["offline","not present","false","0","down","unreachable"].contains(s)) return false
-    return false
-}
-
-// Prefer explicit driver attributes; fallback to state/staleness
-private Boolean _computeIsReachable(String userId, String devId) {
-    def t = settings.thermostat
-    try {
-        String dw  = t?.currentValue("DeviceWatch-DeviceStatus")?.toString()
-        if (dw) return _coerceReachValue(dw)
-
-        String hs  = t?.currentValue("healthStatus")?.toString()
-        if (hs) return _coerceReachValue(hs)
-
-        String pr  = t?.currentValue("presence")?.toString()
-        if (pr) return _coerceReachValue(pr)
-    } catch (ignored) {}
-
-    // Fallback: stale timer logic / last known
-    String kR = _kReachable(userId, devId)
-    Boolean known = (state[kR] as Boolean)
-    if (known != null) return known
-
-    // default optimistic true until proven stale
-    return true
-}
-
-// FIXED: Add runtime validation helper
-private boolean isValidRuntime(int seconds, long sessionStartMs) {
-    if (seconds < 0) return false
-    if (seconds == 0) return true  // Valid for very short sessions
-    
-    long maxPossible = (now() - sessionStartMs) / 1000
-    return seconds <= (maxPossible + 60)  // Allow 60s tolerance for processing delays
-}
-
-private Map _buildTelemetryPayload(Integer runtimeSecondsVal, Map lastSnapshot = null) {
-    def t = settings.thermostat
-    if (!t) return [:]
-
-    String userId   = state.sfpUserId
-    String devId    = t?.getId()?.toString()
-    Boolean isReach = _computeIsReachable(userId, devId)
-
-    def deviceName = (t?.displayName ?: t?.label ?: t?.name) ?: state.sfpHvacName
-    def tempF      = t?.currentTemperature
-    def mode       = t?.currentThermostatMode
-    def opRaw      = t?.currentThermostatOperatingState
-    boolean isActive = ACTIVE_STATES.contains(opRaw?.toString()?.toLowerCase())
-    def scale      = location.temperatureScale
-    def vendor     = t?.getDataValue("manufacturer") ?: t?.getManufacturerName()
-    def timestamp  = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location.timeZone)
-
-    Map out = [
-        userId            : userId,
-        thermostatId      : state.sfpHvacId,
-        currentTemperature: tempF,
-        isActive          : isActive,
-        deviceName        : deviceName,
-        vendor            : vendor,
-        thermostatMode    : mode,
-        temperatureScale  : scale,
-        runtimeSeconds    : runtimeSecondsVal,
-        timestamp         : timestamp,
-        hubitat_deviceId  : devId,
-        ts                : timestamp,
-        // isReachable on every post (attribute-driven if available)
-        isReachable       : isReach
-    ]
-
-    // Include last* fields when provided (session end)
-    if (lastSnapshot) out << lastSnapshot
-
-    return out
-}
-
-// FIXED: Improved runtime calculation and session management
-def handleEvent(evt) {
-    if (!settings.thermostat) return
-    if (!state.sfpAccessToken || !state.sfpUserId || !state.sfpHvacId) {
-        if (enableDebugLogging) log.debug "Telemetry ignored; not fully linked (token/user/hvac missing)."
-        return
-    }
-
-    def t = settings.thermostat
-    def deviceId   = t?.getId()?.toString()
-    def op         = t?.currentThermostatOperatingState
-    boolean isActive = ACTIVE_STATES.contains(op?.toString()?.toLowerCase())
-
-    def userId       = state.sfpUserId
-    def key          = "${userId}-${deviceId}"
-    def sessionKey   = _kSessionStart(userId, deviceId)
-    def wasActiveKey = _kWasActive(userId, deviceId)
-    def sessionLastKey = _kSessionLast(userId, deviceId)
-
-    // Reachability mark-seen on any event
-    _markSeen(userId, deviceId)
-
-    int maxRuntimeSec = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600
-    Integer runtimeSeconds = 0
-    
-    // Get previous state
-    boolean wasActive = (state[wasActiveKey] as Boolean) ?: false
-    Long sessionStart = (state[sessionKey] as Long)
-
-    // Validate session start timestamp
-    if (sessionStart && sessionStart > now()) {
-        if (enableDebugLogging) log.error "Future sessionStart for ${key}; resetting"
-        sessionStart = null
-        state.remove(sessionKey)
-    }
-
-    // Track last* snapshot for active states
-    String lastModeCandidate = _normOp(op)
-    if (["heating","cooling","fanonly"].contains(lastModeCandidate)) {
-        state[sessionLastKey] = [
-            lastMode           : lastModeCandidate,
-            lastIsHeating      : (lastModeCandidate == "heating"),
-            lastIsCooling      : (lastModeCandidate == "cooling"),
-            lastIsFanOnly      : (lastModeCandidate == "fanonly"),
-            lastEquipmentStatus: lastModeCandidate
-        ]
-    }
-
-    // Handle state transitions BEFORE updating wasActive
-    Map lastSnap = null
-    boolean shouldSendTelemetry = false
-    
-    if (isActive && !wasActive) {
-        // Starting new session
-        state[sessionKey] = now()
-        if (enableDebugLogging) log.debug "Starting new session for ${key}"
-        shouldSendTelemetry = true
-        
-    } else if (!isActive && wasActive) {
-        // Ending session - calculate runtime
-        if (sessionStart) {
-            long currentTime = now()
-            long rawRuntime = currentTime - sessionStart
-            runtimeSeconds = Math.max(0, (rawRuntime / 1000) as int)
-            
-            // Warn about negative runtime but don't fail
-            if (rawRuntime < 0) {
-                log.warn "Negative runtime detected for ${key}: ${rawRuntime}ms (clock skew?)"
-            }
-            
-            // Cap runtime but report the actual duration up to the cap
-            if (runtimeSeconds > maxRuntimeSec) {
-                runtimeSeconds = maxRuntimeSec
-                if (enableDebugLogging) log.warn "Runtime capped at ${maxRuntimeSec}s for ${key}"
-            }
-            
-            // Get last snapshot before clearing
-            lastSnap = (state[sessionLastKey] as Map)
-            if (!lastSnap) {
-                String m = _normOp(op)
-                lastSnap = [
-                    lastMode: m,
-                    lastIsHeating: (m == "heating"),
-                    lastIsCooling: (m == "cooling"),
-                    lastIsFanOnly: (m == "fanonly"),
-                    lastEquipmentStatus: m
-                ]
-            }
-            
-            state.remove(sessionKey)
-            state.remove(sessionLastKey)
-            if (enableDebugLogging) log.debug "Session ended for ${key}, runtime=${runtimeSeconds}s"
-            
-        } else {
-            if (enableDebugLogging) log.warn "Device turned off but no sessionStart found for ${key}"
-        }
-        shouldSendTelemetry = true
-        
-    } else if (isActive && wasActive) {
-        // Device remains active - check for long-running sessions
-        if (!sessionStart) {
-            // Missing session start - create one but log the issue
-            state[sessionKey] = now()
-            if (enableDebugLogging) log.warn "Active device missing sessionStart; creating new session for ${key}"
-        } else {
-            // Check if session has been running too long
-            long ageSec = (now() - sessionStart) / 1000
-            if (ageSec > maxRuntimeSec) {
-                // Report the capped session first
-                Map cappedPayload = _buildTelemetryPayload(maxRuntimeSec, null)
-                _authorizedPost(DEFAULT_TELEMETRY_URL, cappedPayload)
-                
-                // Start a new session
-                state[sessionKey] = now()
-                if (enableDebugLogging) log.warn "Session exceeded ${Math.round(ageSec/3600)}h cap; reported ${maxRuntimeSec}s and restarted for ${key}"
-                shouldSendTelemetry = false  // Already sent above
-            }
-        }
-    }
-
-    // Update state AFTER handling transitions
-    state[wasActiveKey] = isActive
-
-    // Only send telemetry when there's a state change or runtime to report
-    if (shouldSendTelemetry || runtimeSeconds > 0) {
-        def payload = _buildTelemetryPayload(runtimeSeconds, lastSnap)
-        _authorizedPost(DEFAULT_TELEMETRY_URL, payload)
-
-        if (enableDebugLogging) {
-            String transition = ""
-            if (isActive && !wasActive) transition = " [OFF→ON]"
-            else if (!isActive && wasActive) transition = " [ON→OFF]"
-            else if (isActive && wasActive) transition = " [ON→ON, capped]"
-            
-            log.debug "Sent: Active=${payload.isActive}, Runtime=${payload.runtimeSeconds}s, isReachable=${payload.isReachable}${lastSnap ? ", lastMode=${lastSnap.lastMode}" : ""}${transition}"
-        }
-    }
-}
-
-/* ---------- STATUS NORMALIZATION ---------- */
-
-// case-insensitive, ignores spaces/underscores/dots
-private def _pick(Map m, List<String> candidates) {
-    if (!m) return null
-    Map norm = [:]
-    m.each { k, v ->
-        if (k != null) {
-            String nk = k.toString().toLowerCase().replaceAll(/[^a-z0-9]/, "")
-            norm[nk] = v
-        }
-    }
-    for (String c : candidates) {
-        String nc = c.toLowerCase().replaceAll(/[^a-z0-9]/, "")
-        if (norm.containsKey(nc)) return norm[nc]
-    }
-    return null
-}
-
-// Convert Bubble's varying keys → stable keys our child device expects
-private Map normalizeStatus(Map raw) {
-    Map out = [:]
-    if (!raw) return out
-
-    out.percentageUsed = _pick(raw, [
-        "percentage_used", "percentage used", "percent_used", "percent used",
-        "percentage", "percent"
-    ])
-
-    out.todayMinutes = _pick(raw, [
-        "today_minutes", "todays_minutes", "today", "daily_active_time_sum",
-        "2.0.1_Daily Active Time Sum"
-    ])
-
-    out.totalMinutes = _pick(raw, [
-        "total_minutes", "total_runtime", "total",
-        "minutes_active", "1.0.1_Minutes active"
-    ])
-
-    out.device_name = _pick(raw, [
-        "device_name", "thermostat_name", "hvac_name", "name"
-    ])
-
-    return out.findAll { k, v -> v != null }  // drop nulls
-}
-
-/* ============================== POLLING ============================== */
-
-def pollStatus() {
-    if (!state.sfpAccessToken || !state.sfpUserId) {
-        if (enableDebugLogging) log.debug "Poll skipped; not linked."
-        return
-    }
-    _ensureValidTokenSkew()
-
-    String url = DEFAULT_STATUS_URL
-    Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
-
-    Map body = [:]
-    if (state.sfpHvacId) body.hvac_uid = state.sfpHvacId
-    else if (enableDebugLogging) log.debug "Polling without hvac_uid (no HVAC selected yet)"
-
-    def params = [
-        uri: url,
-        contentType: "application/json",
-        requestContentType: "application/json",
-        timeout: timeoutSec,
-        headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
-        body: body ?: [:]
-    ]
-
-    if (enableDebugLogging) log.debug "Polling ha_therm_status @ ${url} (hvac=${state.sfpHvacName ?: '(none)'})"
-
-    try {
-        httpPost(params) { resp ->
-            if (resp.status >= 200 && resp.status < 300) {
-                Map js = (resp.data instanceof Map) ? (Map) resp.data : [:]
-                state.sfpLastEnvelope = js
-                Map b  = _bubbleBody(js)
-
-                if (_isBubbleSoft401(b)) {
-                    if (enableDebugLogging) log.warn "Soft-401 on poll — attempting refresh"
-                    if (_refreshToken()) _retryPoll()
-                    return
-                }
-
-                Map normalized = normalizeStatus(b ?: [:])
-
-                // OPTIONAL: expose driver-reported reachability and computed isReachable on the status view
-                try {
-                    def t = settings.thermostat
-                    if (t) {
-                        normalized.deviceWatch  = t.currentValue("DeviceWatch-DeviceStatus")
-                        normalized.healthStatus = t.currentValue("healthStatus")
-                        normalized.presence     = t.currentValue("presence")
-                        normalized.isReachable  = _computeIsReachable(state.sfpUserId, t.getId().toString())
-                    }
-                } catch (ignored) {}
-
-                state.sfpLastStatus = normalized
-                updateStatusChild(normalized)
-
-                if (enableDebugLogging) {
-                    if (state.sfpLastStatus.isEmpty()) {
-                        log.debug "Poll OK but empty payload. Keys: ${js?.keySet()}"
-                    } else {
-                        log.debug "Poll OK; keys=${state.sfpLastStatus.keySet()}"
-                    }
-                }
-            } else if (resp.status == 401) {
-                if (_refreshToken()) _retryPoll()
-            } else {
-                log.warn "Poll non-OK status: ${resp.status}"
-            }
-        }
-    } catch (groovyx.net.http.HttpResponseException e) {
-        if ((e.statusCode as Integer) == 401) {
-            if (_refreshToken()) _retryPoll()
-        } else {
-            log.error "Poll HTTP ${e.statusCode}: ${e.message}"
-        }
-    } catch (Exception e) {
-        log.error "Poll error: ${e}"
-    }
-}
-
-private void _retryPoll() { runIn(3, "pollStatus") }
-
-/* ============================== SESSION MAINTENANCE & STATS ============================== */
-
-def scheduleCleanup() {
-    unschedule(cleanupOldSessions)
-    switch ((settings.cleanupFrequency ?: "1 Hour") as String) {
-        case "30 Minutes": runEvery30Minutes(cleanupOldSessions); break
-        case "2 Hours"   : schedule("0 0 */2 * * ?", cleanupOldSessions); break
-        case "6 Hours"   : schedule("0 0 */6 * * ?", cleanupOldSessions); break
-        case "12 Hours"  : schedule("0 0 */12 * * ?", cleanupOldSessions); break
-        default          : runEvery1Hour(cleanupOldSessions); break
-    }
-}
-
-// FIXED: Improved cleanup with orphaned state handling
-def cleanupOldSessions() {
-    int maxRuntimeMs = ((settings.maxRuntimeHours ?: 24) as Integer) * 3600000
-    long cutoff = now() - maxRuntimeMs
-    List keysToRemove = []
-    int activeSessionsCount = 0
-
-    // Clean up old sessions
-    state.each { k, v ->
-        if (k.startsWith("sessionStart_")) {
-            if (v && (v as Long) < cutoff) {
-                keysToRemove << k
-                if (enableDebugLogging) log.debug "Cleaning old session: ${k}"
-            } else if (v) {
-                activeSessionsCount++
-            }
-        }
-    }
-
-    keysToRemove.each { key ->
-        state.remove(key)
-        def deviceKey = key.replace("sessionStart_", "")
-        state.remove("wasActive_${deviceKey}")
-        state.remove("sessionLast_${deviceKey}") // also clear last snapshot if stale
-    }
-
-    // Clean up orphaned wasActive states for devices that no longer exist
-    if (settings.thermostat) {
-        String currentDeviceId = settings.thermostat.getId()?.toString()
-        String currentUserId = state.sfpUserId
-        
-        if (currentDeviceId && currentUserId) {
-            String currentKey = "${currentUserId}-${currentDeviceId}"
-            List orphanedKeys = []
-            
-            state.each { k, v ->
-                if (k.startsWith("wasActive_") || k.startsWith("sessionLast_") || k.startsWith("isReachable_") || k.startsWith("lastSeen_")) {
-                    String keyDevice = k.split("_", 2)[1]
-                    if (keyDevice != currentKey) {
-                        orphanedKeys << k
-                    }
-                }
-            }
-            
-            orphanedKeys.each { state.remove(it) }
-            if (orphanedKeys.size() > 0 && enableDebugLogging) {
-                log.debug "Cleaned ${orphanedKeys.size()} orphaned state keys"
-            }
-        }
-    }
-
-    if (keysToRemove.size() > 0 && enableDebugLogging) {
-        log.debug "Cleaned ${keysToRemove.size()} old sessions; ${activeSessionsCount} active remain"
-    }
-}
-
-def logSessionStats() {
-    def stats = getSessionStats()
-    log.info "Session Stats: ${stats.activeSessions} active, ${stats.totalDevices} total devices, oldest: ${stats.oldestSessionMinutes} min"
-}
-
-def getSessionStats() {
-    int activeSessions = 0
-    int totalDevices = 0
-    long oldest = now()
-
-    state.each { k, v ->
-        if (k.startsWith("sessionStart_") && v) {
-            activeSessions++
-            long started = (v as Long)
-            if (started < oldest) oldest = started
-        } else if (k.startsWith("wasActive_")) {
-            totalDevices++
-        }
-    }
-
-    long oldestAgeMin = activeSessions > 0 ? Math.round((now() - oldest) / 1000 / 60) : 0
-    if (enableDebugLogging) {
-        log.debug "Stats: active=${activeSessions}, total=${totalDevices}, oldest=${oldestAgeMin} min"
-    }
-    return [activeSessions: activeSessions, totalDevices: totalDevices, oldestSessionMinutes: oldestAgeMin]
-}
-
-def resetAllDeviceSessions() {
-    List keysToRemove = []
-    state.each { k, v ->
-        if (k.startsWith("sessionStart_") || k.startsWith("wasActive_") || k.startsWith("sessionLast_") ||
-            k.startsWith("isReachable_") || k.startsWith("lastSeen_")) keysToRemove << k
-    }
-    keysToRemove.each { state.remove(it) }
-    log.warn "RESET: Cleared ${keysToRemove.size()} session-tracking entries"
-}
-
-/* ============================== AUTH HELPERS ============================== */
-
-private Map _bubbleBody(Object respData) {
-    Map top = (respData instanceof Map) ? (Map) respData : [:]
-    Map body = (top.response instanceof Map) ? (Map) top.response : top
-    def inner = (body.body instanceof Map) ? (Map) body.body : null
-    if (inner) return inner
-    return body
-}
-
-private boolean _isBubbleSoft401(Map body) {
-    if (!body) return false
-    def status = body.status ?: body.status_code
-    if (status != null) {
-        try { if ((status as Integer) == 401) return true } catch (ignored) {}
-    }
-    def err = (body.error ?: "").toString().toLowerCase()
-    def msg = (body.message ?: "").toString().toLowerCase()
-    if (err.contains("invalid_token")) return true
-    if (msg.contains("access token") && (msg.contains("invalid") || msg.contains("expired"))) return true
-    def nested = (body.body instanceof Map) ? (Map) body.body : null
-    if (nested) return _isBubbleSoft401(nested)
-    return false
-}
-
-private boolean _ensureValidTokenSkew() {
-    Long exp = (state.sfpExpiresAt as Long)
-    if (!exp) return true
-    Long nowSec = (now() / 1000L) as Long
-    if (nowSec >= (exp - TOKEN_SKEW_SECONDS)) {
-        if (enableDebugLogging) log.debug "Pre-refreshing token (skew). now=${nowSec}, exp=${exp}"
-        return _refreshToken()
-    }
-    return true
-}
-
-private boolean _refreshToken() {
-    String refreshTarget = DEFAULT_REFRESH_URL
-    String rt = (state.sfpRefreshToken ?: "").toString()
-    Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
-
-    if (!rt) {
-        log.warn "No refresh_token available; cannot refresh."
+private boolean _issueCoreTokenOrLog() {
+    String at = (state.sfpAccessToken ?: "")
+    if (!at) {
+        log.warn "❌ Cannot issue core token — no Bubble access_token"
         return false
     }
 
     try {
+        log.info "🔄 Requesting new core_token from Bubble..."
+        
         Map respMap
         httpPost([
-            uri: refreshTarget,
+            uri: BUBBLE_CORE_JWT_URL,
             contentType: "application/json",
             requestContentType: "application/json",
-            timeout: timeoutSec,
-            body: [ refresh_token: rt ]
-        ]) { resp ->
-            respMap = (resp.data instanceof Map) ? resp.data : [:]
-        }
-
-        def body = _bubbleBody(respMap)
-        String at  = (body?.access_token ?: body?.token ?: "").toString()
-        String nrt = (body?.refresh_token ?: rt).toString()
-        Long   exp = null
-        try { exp = (body?.expires_at as Long) } catch (e) { exp = null }
-
-        if (_isBubbleSoft401(body)) {
-            log.warn "Refresh returned soft-401 / invalid_token."
-            return false
-        }
-
-        if (at && exp) {
-            state.sfpAccessToken  = at
-            state.sfpRefreshToken = nrt
-            state.sfpExpiresAt    = exp
-            if (enableDebugLogging) log.debug "Token refreshed; exp=${exp}"
+            headers: [ Authorization: "Bearer ${at}" ],
+            body: [ user_id: state.sfpUserId ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> respMap = resp.data }
+        
+        Map body = _bubbleBody(respMap)
+        
+        String core = (body?.core_token ?: body?.token ?: "").toString()
+        Long exp = (body?.core_token_exp ?: body?.exp ?: body?.expires_at) as Long
+        
+        if (core) {
+            state.sfpCoreToken = core
+            state.sfpCoreTokenExp = exp
+            log.info "✅ Core token refreshed (exp: ${exp})"
             return true
         } else {
-            log.warn "Refresh response missing access_token/expires_at: ${body}"
+            log.error "❌ Core token response missing token: ${body}"
             return false
         }
-    } catch (groovyx.net.http.HttpResponseException e) {
-        log.error "Refresh HTTP ${e.statusCode}: ${e.message}"
-        return false
     } catch (Exception e) {
-        log.error "Refresh error: ${e}"
+        log.error "❌ Failed to issue core token: ${e.message}"
         return false
     }
 }
 
-/* ============================== HTTP HELPERS ============================== */
+/* ============================== BUBBLE STATUS POLLING ============================== */
 
-private void _authorizedPost(String url, Map payload) {
-    _ensureValidTokenSkew()
-
-    Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
-    Map params = [
-        uri: url,
-        contentType: "application/json",
-        requestContentType: "application/json",
-        timeout: timeoutSec,
-        headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
-        body: payload ?: [:]
-    ]
-
-    if (enableDebugLogging) {
-        log.debug "POST ${url}"
-        log.debug "Payload: ${payload}"
+def pollBubbleStatus() {
+    if (!state.sfpAccessToken || !state.sfpHvacId) {
+        if (enableDebugLogging) log.debug "⏭️ Skipping status poll (not linked)"
+        return
     }
 
     try {
-        httpPost(params) { resp ->
-            if (resp.status >= 200 && resp.status < 300) {
-                Map js = (resp.data instanceof Map) ? (Map) resp.data : [:]
-                Map b  = _bubbleBody(js)
+        if (enableDebugLogging) log.debug "📡 Polling Bubble status…"
+        
+        Map respMap
+        httpPost([
+            uri: BUBBLE_STATUS_URL,
+            contentType: "application/json",
+            requestContentType: "application/json",
+            headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
+            body: [ hvac_id: state.sfpHvacId ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> respMap = resp.data }
 
-                if (_isBubbleSoft401(b)) {
-                    if (_refreshToken()) {
-                        httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
-                    }
-                } else {
-                    if (enableDebugLogging) log.debug "Telemetry OK (${resp.status})"
-                }
-            } else if (resp.status == 401) {
-                if (_refreshToken()) {
-                    httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
-                }
-            } else {
-                log.warn "Telemetry non-OK status: ${resp.status}"
-            }
-        }
-    } catch (groovyx.net.http.HttpResponseException e) {
-        if ((e.statusCode as Integer) == 401) {
-            if (_refreshToken()) {
-                try {
-                    httpPost(params) { r2 -> if (enableDebugLogging) log.debug "Telemetry retry: ${r2.status}" }
-                } catch (Exception ex) { log.error "Telemetry retry error: ${ex}" }
-            }
-        } else {
-            log.error "Telemetry HTTP ${e.statusCode}: ${e.message}"
+        Map body = _bubbleBody(respMap)
+        state.sfpLastStatus = body
+        
+        if (enableDebugLogging) {
+            log.debug "✅ Bubble status: runtime=${body.runtime_hours_since_install}h, filter_life=${body.filter_life_percentage}%"
         }
     } catch (Exception e) {
-        log.error "Telemetry error: ${e}"
+        log.error "❌ Bubble status poll failed: ${e.message}"
     }
-}
-
-/* ============================== CHILD DEVICES ============================== */
-
-private void ensureChildren() {
-    String dniBase = "sfp-${app.id}"
-    if (!getChildDevice("${dniBase}-reset")) {
-        try {
-            addChildDevice("smartfilterpro", "SmartFilterPro Reset Button", "${dniBase}-reset",
-                [name:"SmartFilterPro Reset", label:"SmartFilterPro Reset"])
-        } catch (e) { log.error "Failed to create Reset child: ${e}" }
-    }
-    if (!getChildDevice("${dniBase}-status")) {
-        try {
-            addChildDevice("smartfilterpro", "SmartFilterPro Status Sensor", "${dniBase}-status",
-                [name:"SmartFilterPro Status", label:"SmartFilterPro Status"])
-        } catch (e) { log.error "Failed to create Status child: ${e}" }
-    }
-}
-
-private void updateStatusChild(Map payload) {
-    def d = getChildDevice("sfp-${app.id}-status")
-    if (!d) return
-
-    def pct   = payload.percentageUsed
-    def today = payload.todayMinutes
-    def total = payload.totalMinutes
-    def name  = payload.device_name ?: state.sfpHvacName
-
-    if (pct   != null) d.sendEvent(name:"percentageUsed", value: pct)
-    if (today != null) d.sendEvent(name:"todayMinutes",   value: today)
-    if (total != null) d.sendEvent(name:"totalMinutes",   value: total)
-    if (name)          d.sendEvent(name:"deviceName",     value: name)
-
-    // Optional: surface reachability signals on the status child as attributes too
-    if (payload.isReachable != null) d.sendEvent(name:"isReachable", value: payload.isReachable)
-    if (payload.deviceWatch  != null) d.sendEvent(name:"deviceWatch", value: payload.deviceWatch)
-    if (payload.healthStatus != null) d.sendEvent(name:"healthStatus", value: payload.healthStatus)
-    if (payload.presence     != null) d.sendEvent(name:"presence", value: payload.presence)
-
-    d.sendEvent(name:"lastUpdated",
-        value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
-}
-
-// called by the Reset child driver
-def resetNow() {
-    String url = DEFAULT_RESET_URL
-    if (!state.sfpAccessToken || !state.sfpUserId || !state.sfpHvacId) {
-        log.warn "Reset skipped; missing token/user/hvac."
-        return
-    }
-    _ensureValidTokenSkew()
-    Map payload = [user_id: state.sfpUserId, hvac_id: state.sfpHvacId]
-    _authorizedPost(url, payload)
-    runIn(3, "pollStatus")
-}
-
-// called by the Status child driver ("Refresh" command)
-def pollNow() { pollStatus() }
-
-/* ============================== LINK HELPERS ============================== */
-
-def cloudShowStatusLink() {
-    return "${appEndpointBase()}/status?access_token=${getOrCreateAppToken()}"
-}
-
-private String getOrCreateAppToken() {
-    if (!state.appAccessToken) {
-        createAccessToken()
-        state.appAccessToken = state.accessToken
-    }
-    return state.appAccessToken
-}
-
-private String hubUidSafe() {
-    try { return getHubUID() }
-    catch (e) { return location?.hubs?.first()?.id }
-}
-
-private String appEndpointBase() {
-    String base = getApiServerUrl() ?: ""
-    if (base.startsWith("https://cloud.hubitat.com")) {
-        if (base ==~ /https:\/\/cloud\.hubitat\.com\/api\/[A-Za-z0-9-]+.*/) {
-            return "${base}/apps/${app.id}"
-        } else {
-            return "https://cloud.hubitat.com/api/${hubUidSafe()}/apps/${app.id}"
-        }
-    }
-    return "${base}/apps/api/${app.id}"
-}
-
-private void logLink(String pathWithQuery) {
-    def full = "${appEndpointBase()}${pathWithQuery}"
-    log.info "SmartFilterPro link → ${full}"
-}
-
-/* ============================== CONNECTIVITY SCAN ============================== */
-
-// Respect explicit attributes if present; only use staleness if none exist
-def checkConnectivity() {
-    if (!settings.thermostat || !state.sfpUserId) return
-    String userId = state.sfpUserId
-    String devId  = settings.thermostat?.getId()?.toString()
-    if (!devId) return
-
-    // If the driver exposes a live reachability attribute, don't override it with staleness
-    def t = settings.thermostat
-    boolean hasExplicit =
-        (t?.getSupportedAttributes()?.any { it?.name == "DeviceWatch-DeviceStatus" }) ||
-        (t?.getSupportedAttributes()?.any { it?.name == "healthStatus" }) ||
-        (t?.getSupportedAttributes()?.any { it?.name == "presence" })
-
-    if (hasExplicit) return  // attribute will drive state via handleReachabilityEvent
-
-    Long nowMs  = now()
-    Long staleMs = ((settings.reachabilityStaleMinutes ?: DEFAULT_STALE_MINUTES) as Integer) * 60_000L
-    _maybeMarkUnreachableIfStale(userId, devId, nowMs, staleMs)
 }
