@@ -194,6 +194,96 @@ private boolean checkDeviceReachable(def dev) {
     }
 }
 
+/**
+ * Debug function to diagnose online status issues.
+ * Call from Hubitat IDE or add a button to trigger it.
+ * Check logs for which condition is causing is_reachable to be false.
+ */
+def debugOnlineStatus() {
+    log.info "========== ONLINE STATUS DIAGNOSTIC =========="
+
+    // 1. Check if thermostat is configured
+    if (!settings.thermostat) {
+        log.error "❌ No thermostat selected in settings"
+        return
+    }
+    log.info "✅ Thermostat: ${settings.thermostat.displayName}"
+
+    // 2. Check device attributes
+    def temp = settings.thermostat.currentTemperature
+    def opState = settings.thermostat.currentThermostatOperatingState
+    def fanMode = settings.thermostat.currentThermostatFanMode
+    def lastActivity = settings.thermostat.getLastActivity()
+    def healthStatus = settings.thermostat.getStatus()
+
+    log.info "📊 Current Temperature: ${temp}"
+    log.info "📊 Operating State: ${opState}"
+    log.info "📊 Fan Mode: ${fanMode}"
+    log.info "📊 Health Status: ${healthStatus}"
+    log.info "📊 Last Activity: ${lastActivity}"
+
+    // 3. Check what checkDeviceReachable returns
+    boolean isReachable = checkDeviceReachable(settings.thermostat)
+    log.info "🔍 checkDeviceReachable() returns: ${isReachable}"
+
+    // 4. Check individual reachability conditions
+    log.info "--- Reachability Checks ---"
+
+    // Check 1: Health status
+    if (healthStatus) {
+        log.info "   Health status: '${healthStatus}' (offline check: ${healthStatus.toLowerCase() == 'offline'})"
+    } else {
+        log.info "   Health status: null (skipping check)"
+    }
+
+    // Check 2: Last activity time
+    if (lastActivity) {
+        long lastActivityMs = lastActivity.time
+        long twoHoursAgo = now() - (2 * 60 * 60 * 1000)
+        long minutesAgo = (now() - lastActivityMs) / 60000
+        boolean tooOld = (lastActivityMs < twoHoursAgo)
+        log.info "   Last activity: ${minutesAgo} minutes ago (>2hr check: ${tooOld})"
+    } else {
+        log.info "   Last activity: null (skipping check)"
+    }
+
+    // Check 3: Null attributes
+    boolean bothNull = (temp == null && opState == null)
+    log.info "   Null attributes check: temp=${temp}, opState=${opState}, bothNull=${bothNull}"
+
+    // 5. Check authentication state
+    log.info "--- Authentication State ---"
+    log.info "   sfpAccessToken: ${state.sfpAccessToken ? 'SET' : 'NOT SET'}"
+    log.info "   sfpUserId: ${state.sfpUserId ?: 'NOT SET'}"
+    log.info "   sfpHvacId: ${state.sfpHvacId ?: 'NOT SET'}"
+    log.info "   sfpCoreToken: ${state.sfpCoreToken ? 'SET' : 'NOT SET'}"
+
+    // 6. Build and show what payload WOULD be sent
+    log.info "--- Payload Preview ---"
+    String op = settings.thermostat.currentThermostatOperatingState ?: "idle"
+    String fan = settings.thermostat.currentThermostatFanMode ?: "auto"
+    String equipStatus = classifyState(op, fan, false)
+
+    log.info "   device_key: ${state.sfpHvacId}"
+    log.info "   is_reachable: ${isReachable}"
+    log.info "   equipment_status: ${equipStatus}"
+    log.info "   temperature_f: ${temp}"
+
+    log.info "========== END DIAGNOSTIC =========="
+
+    // Return summary
+    if (!isReachable) {
+        log.warn "⚠️ ISSUE FOUND: Device is being marked as NOT REACHABLE"
+        log.warn "   Check the conditions above to see which check is failing"
+    } else if (!state.sfpAccessToken) {
+        log.warn "⚠️ ISSUE FOUND: Not authenticated with SmartFilterPro"
+    } else if (!state.sfpHvacId) {
+        log.warn "⚠️ ISSUE FOUND: No HVAC ID configured"
+    } else {
+        log.info "✅ All checks passed - device should show as online"
+    }
+}
+
 /* ============================== LOGIN / HVAC ============================== */
 
 def cloudLogin() {
