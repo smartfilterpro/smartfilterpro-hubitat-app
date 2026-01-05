@@ -510,11 +510,16 @@ def handleEvent(evt) {
     String keyStart = "sessionStart_${uid}-${devId}"
     String keyWas   = "wasActive_${uid}-${devId}"
     String keyLastType = "lastEquipmentStatus_${uid}-${devId}"
+    String keyLastRuntimePost = "lastRuntimePost_${uid}-${devId}"
 
     boolean wasActive = (state[keyWas] as Boolean) ?: false
     String lastEquipmentStatus = state[keyLastType] ?: "Idle"
 
     boolean equipmentModeChanged = (equipmentStatus != lastEquipmentStatus)
+
+    // Debounce: Check if we recently posted runtime (within 5 seconds) to prevent race condition
+    Long lastRuntimePostTime = (state[keyLastRuntimePost] as Long) ?: 0
+    boolean recentlyPostedRuntime = (now() - lastRuntimePostTime) < 5000
 
     // Handle thermostat mode change (environmental update)
     if (thermostatModeChanged && !equipmentModeChanged && !isStateChangingEvent) {
@@ -544,14 +549,17 @@ def handleEvent(evt) {
         return
     }
 
-    // Calculate runtime if transitioning
+    // Calculate runtime if transitioning (with debounce to prevent double-posting)
     Integer runtimeSeconds = null
-    if (equipmentModeChanged && wasActive && state[keyStart]) {
+    if (equipmentModeChanged && wasActive && state[keyStart] && !recentlyPostedRuntime) {
         Long start = (state[keyStart] as Long)
         if (start) {
             runtimeSeconds = Math.max(0L, ((now() - start) / 1000L) as int)
+            state[keyLastRuntimePost] = now()  // Mark runtime post time for debounce
             if (enableDebugLogging) log.debug "⏱️ Runtime calculated: ${runtimeSeconds}s (was ${lastEquipmentStatus})"
         }
+    } else if (recentlyPostedRuntime && equipmentModeChanged && wasActive) {
+        if (enableDebugLogging) log.debug "⏭️ Skipping duplicate runtime calculation (debounce active)"
     }
 
     // Session START (inactive → active)
@@ -573,34 +581,49 @@ def handleEvent(evt) {
 
     // Session END (active → inactive)
     if (!isActive && wasActive) {
+        // Skip if this transition was already handled by a recent event (race condition protection)
+        if (recentlyPostedRuntime && runtimeSeconds == null) {
+            if (enableDebugLogging) log.debug "⏭️ Skipping duplicate Session END (already posted by concurrent event)"
+            state[keyWas] = false
+            state[keyLastType] = equipmentStatus
+            return
+        }
+
         state.remove(keyStart)
         if (enableDebugLogging) log.debug "🛑 Session END: ${lastEquipmentStatus} -> Idle (runtime=${runtimeSeconds}s)"
-        
+
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-        
+
         state[keyWas] = false
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-        
+
         _postToCoreWithJwt(payload)
         return
     }
 
     // Equipment mode changed while active (Heating → Cooling, etc.)
     if (isActive && equipmentModeChanged) {
+        // Skip if this transition was already handled by a recent event (race condition protection)
+        if (recentlyPostedRuntime && runtimeSeconds == null) {
+            if (enableDebugLogging) log.debug "⏭️ Skipping duplicate mode switch (already posted by concurrent event)"
+            state[keyLastType] = equipmentStatus
+            return
+        }
+
         state[keyStart] = now()
         if (enableDebugLogging) log.debug "🔄 Equipment mode switch: ${lastEquipmentStatus} → ${equipmentStatus} (runtime=${runtimeSeconds}s)"
-        
+
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-        
+
         state[keyWas] = true
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-        
+
         _postToCoreWithJwt(payload)
         return
     }
