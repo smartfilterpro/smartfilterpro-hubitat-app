@@ -801,7 +801,7 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
         return success
     } catch (Exception e) {
         log.error "❌ Core post exception: ${e.message}"
-        log.error "❌ Exception class: ${e.getClass().getName()}"
+        log.error "❌ Exception details: ${e}"
 
         String errMsg = e.toString()
         boolean is401 = errMsg.contains("401") || errMsg.toLowerCase().contains("unauthorized")
