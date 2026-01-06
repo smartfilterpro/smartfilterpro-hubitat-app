@@ -743,10 +743,14 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
 /* ============================== CORE POST / TOKEN ============================== */
 
 private boolean _postToCoreWithJwt(Object body) {
+    if (enableDebugLogging) log.debug "🚀 _postToCoreWithJwt called"
+
     if (!_ensureCoreTokenValid()) {
         log.warn "❌ No valid core_token available; skipping Core post"
         return false
     }
+
+    if (enableDebugLogging) log.debug "✅ Core token validated, proceeding with POST"
     return _postToCoreAttempt(body, false)
 }
 
@@ -756,33 +760,52 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
 
     if (isRetry) log.info "🔄 RETRY: Attempting Core post with refreshed token..."
 
+    def requestBody = body instanceof List ? body : [body]
+
     Map params = [
         uri: CORE_INGEST_URL,
         contentType: "application/json",
         requestContentType: "application/json",
         timeout: timeoutSec,
         headers: [ Authorization: "Bearer ${token}" ],
-        body: body instanceof List ? body : [body]
+        body: requestBody
     ]
 
+    // Debug: Log outgoing request details
+    if (enableDebugLogging) {
+        log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
+        log.debug "📤 Token present: ${token ? 'yes (' + token.take(20) + '...)' : 'NO TOKEN'}"
+        log.debug "📤 Timeout: ${timeoutSec}s"
+        log.debug "📤 Body (${requestBody.size()} events):"
+        requestBody.each { evt ->
+            log.debug "   → device_key: ${evt.device_key}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, runtime_seconds: ${evt.runtime_seconds}"
+        }
+    }
+
+    boolean success = false
     try {
         httpPost(params) { resp ->
+            if (enableDebugLogging) {
+                log.debug "📥 Core response status: ${resp.status}"
+                log.debug "📥 Core response data: ${resp.data}"
+            }
             if (resp.status >= 200 && resp.status < 300) {
-                if (enableDebugLogging) log.debug "✅ Core OK (${resp.status})"
+                log.info "✅ Core POST OK (${resp.status}) - ${requestBody.size()} event(s) sent"
                 if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
-                return true
+                success = true
             } else {
-                log.warn "⚠️ Core returned non-OK status: ${resp.status}"
-                return false
+                log.warn "⚠️ Core returned non-OK status: ${resp.status}, data: ${resp.data}"
+                success = false
             }
         }
-        return true
+        return success
     } catch (Exception e) {
         log.error "❌ Core post exception: ${e.message}"
-        
+        log.error "❌ Exception class: ${e.getClass().getName()}"
+
         String errMsg = e.toString()
         boolean is401 = errMsg.contains("401") || errMsg.toLowerCase().contains("unauthorized")
-        
+
         if (is401 && !isRetry) {
             log.warn "⚠️ Core 401 — refreshing token and retrying"
             if (_issueCoreTokenOrLog()) {
