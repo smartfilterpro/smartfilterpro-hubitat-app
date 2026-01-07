@@ -930,6 +930,13 @@ def pollBubbleStatus() {
         Map body = _bubbleBody(respMap)
         state.sfpLastStatus = body
 
+        // Update HVAC name if it changed in Bubble
+        if (body.deviceName && body.deviceName != state.sfpHvacName) {
+            log.info "📝 HVAC name updated: '${state.sfpHvacName}' → '${body.deviceName}'"
+            state.sfpHvacName = body.deviceName
+            updateChildDeviceLabels()
+        }
+
         if (enableDebugLogging) {
             log.debug "✅ Bubble status: filterHealth=${body.filterHealth}%, minutesActive=${body.minutesActive}"
         }
@@ -939,6 +946,26 @@ def pollBubbleStatus() {
 
     } catch (Exception e) {
         log.error "❌ Bubble status poll failed: ${e.message}"
+    }
+}
+
+private void updateChildDeviceLabels() {
+    def statusDev = getStatusDevice()
+    if (statusDev) {
+        String newLabel = "SmartFilterPro Status${state.sfpHvacName ? ' - ' + state.sfpHvacName : ''}"
+        if (statusDev.label != newLabel) {
+            statusDev.setLabel(newLabel)
+            log.info "📝 Updated status device label: ${newLabel}"
+        }
+    }
+
+    def resetDev = getResetDevice()
+    if (resetDev) {
+        String newLabel = "SmartFilterPro Reset${state.sfpHvacName ? ' - ' + state.sfpHvacName : ''}"
+        if (resetDev.label != newLabel) {
+            resetDev.setLabel(newLabel)
+            log.info "📝 Updated reset button label: ${newLabel}"
+        }
     }
 }
 
