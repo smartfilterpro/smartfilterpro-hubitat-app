@@ -78,15 +78,27 @@ def mainPage() {
             input "createStatusDevice", "bool", title: "Create Status Device",
                  description: "Creates a device showing filter health and runtime",
                  defaultValue: false, submitOnChange: true
+            input "createResetDevice", "bool", title: "Create Reset Button",
+                 description: "Creates a button device to reset filter tracking",
+                 defaultValue: false, submitOnChange: true
         }
 
-        section("Status") {
+        section("Devices") {
             def statusDev = getStatusDevice()
+            def resetDev = getResetDevice()
             if (statusDev) {
                 paragraph "📊 Status Device: ${statusDev.displayName}"
             } else if (settings.createStatusDevice) {
-                paragraph "Status device will be created when you click Done"
+                paragraph "📊 Status device will be created when you click Done"
             }
+            if (resetDev) {
+                paragraph "🔄 Reset Button: ${resetDev.displayName}"
+            } else if (settings.createResetDevice) {
+                paragraph "🔄 Reset button will be created when you click Done"
+            }
+        }
+
+        section("Status") {
             href "statusPage", title: "View Last Bubble Status (20min poll)",
                  description: "Shows last ha_therm_status from Bubble"
         }
@@ -385,11 +397,17 @@ def initialize() {
         log.warn "⚠️ No thermostat selected - skipping subscriptions"
     }
 
-    // Handle status device creation/deletion based on setting
+    // Handle child device creation/deletion based on settings
     if (settings.createStatusDevice) {
         createStatusDevice()
     } else {
         deleteStatusDevice()
+    }
+
+    if (settings.createResetDevice) {
+        createResetDevice()
+    } else {
+        deleteResetDevice()
     }
 
     unschedule()
@@ -982,5 +1000,86 @@ private void updateStatusDevice(Map status) {
     if (device && status) {
         device.updateStatus(status)
         if (enableDebugLogging) log.debug "📊 Updated status device with: filterHealth=${status.filterHealth}, minutesActive=${status.minutesActive}"
+    }
+}
+
+/* ============================== RESET BUTTON DEVICE MANAGEMENT ============================== */
+
+private def getResetDevice() {
+    String dni = "sfp-reset-${app.id}"
+    return getChildDevice(dni)
+}
+
+def createResetDevice() {
+    String dni = "sfp-reset-${app.id}"
+    def existing = getChildDevice(dni)
+
+    if (existing) {
+        log.info "🔄 Reset button already exists: ${existing.displayName}"
+        return existing
+    }
+
+    try {
+        String label = "SmartFilterPro Reset${state.sfpHvacName ? ' - ' + state.sfpHvacName : ''}"
+        def device = addChildDevice("smartfilterpro", "SmartFilterPro Reset Button", dni, [
+            label: label,
+            isComponent: false
+        ])
+        log.info "✅ Created reset button: ${label}"
+        return device
+    } catch (Exception e) {
+        log.error "❌ Failed to create reset button: ${e.message}"
+        return null
+    }
+}
+
+def deleteResetDevice() {
+    String dni = "sfp-reset-${app.id}"
+    def existing = getChildDevice(dni)
+
+    if (existing) {
+        try {
+            deleteChildDevice(dni)
+            log.info "🗑️ Deleted reset button"
+            return true
+        } catch (Exception e) {
+            log.error "❌ Failed to delete reset button: ${e.message}"
+            return false
+        }
+    }
+    return true
+}
+
+/* ============================== FILTER RESET ============================== */
+
+def resetNow() {
+    if (!state.sfpAccessToken || !state.sfpHvacId) {
+        log.warn "❌ Cannot reset filter - not linked to SmartFilterPro"
+        return false
+    }
+
+    try {
+        log.info "🔄 Resetting filter tracking for HVAC: ${state.sfpHvacName ?: state.sfpHvacId}"
+
+        Map respMap
+        httpPost([
+            uri: BUBBLE_RESET_URL,
+            contentType: "application/json",
+            requestContentType: "application/json",
+            headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
+            body: [ hvac_id: state.sfpHvacId ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> respMap = resp.data }
+
+        Map body = _bubbleBody(respMap)
+        log.info "✅ Filter reset successful: ${body}"
+
+        // Refresh status after reset
+        runIn(2, "pollBubbleStatus")
+
+        return true
+    } catch (Exception e) {
+        log.error "❌ Filter reset failed: ${e.message}"
+        return false
     }
 }

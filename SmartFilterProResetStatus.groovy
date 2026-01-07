@@ -15,32 +15,53 @@ metadata {
     }
 }
 
+def installed() {
+    log.info "SmartFilterPro Status Sensor installed"
+    refresh()
+}
+
+def updated() {
+    log.info "SmartFilterPro Status Sensor updated"
+}
+
 def refresh() {
+    log.info "Refresh triggered - calling parent.pollBubbleStatus()"
     parent?.pollBubbleStatus()
 }
 
 def updateStatus(Map status) {
+    log.info "updateStatus called with: ${status}"
+
     if (status == null) {
         log.warn "updateStatus called with null status"
         return
     }
 
     if (status.filterHealth != null) {
+        log.debug "Setting filterHealth: ${status.filterHealth}"
         sendEvent(name: "filterHealth", value: status.filterHealth, unit: "%")
     }
 
     if (status.minutesActive != null) {
+        def hours = (status.minutesActive / 60).round(2)
+        log.debug "Setting minutesActive: ${status.minutesActive}, hoursActive: ${hours}"
         sendEvent(name: "minutesActive", value: status.minutesActive, unit: "min")
-        sendEvent(name: "hoursActive", value: (status.minutesActive / 60).round(2), unit: "hr")
+        sendEvent(name: "hoursActive", value: hours, unit: "hr")
     }
 
     if (status.deviceName != null) {
+        log.debug "Setting deviceName: ${status.deviceName}"
         sendEvent(name: "deviceName", value: status.deviceName)
     }
 
     if (status.lastUpdated != null) {
+        log.debug "Setting lastUpdated: ${status.lastUpdated}"
         sendEvent(name: "lastUpdated", value: status.lastUpdated)
     }
 
-    sendEvent(name: "lastRefresh", value: new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone))
+    def refreshTime = new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone)
+    log.debug "Setting lastRefresh: ${refreshTime}"
+    sendEvent(name: "lastRefresh", value: refreshTime)
+
+    log.info "updateStatus completed - all events sent"
 }
