@@ -75,9 +75,18 @@ def mainPage() {
             input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true
             input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
                  defaultValue: DEFAULT_HTTP_TIMEOUT, range: "5..120"
+            input "createStatusDevice", "bool", title: "Create Status Device",
+                 description: "Creates a device showing filter health and runtime",
+                 defaultValue: false, submitOnChange: true
         }
 
         section("Status") {
+            def statusDev = getStatusDevice()
+            if (statusDev) {
+                paragraph "📊 Status Device: ${statusDev.displayName}"
+            } else if (settings.createStatusDevice) {
+                paragraph "Status device will be created when you click Done"
+            }
             href "statusPage", title: "View Last Bubble Status (20min poll)",
                  description: "Shows last ha_therm_status from Bubble"
         }
@@ -374,6 +383,13 @@ def initialize() {
         log.info "✅ Subscriptions created"
     } else {
         log.warn "⚠️ No thermostat selected - skipping subscriptions"
+    }
+
+    // Handle status device creation/deletion based on setting
+    if (settings.createStatusDevice) {
+        createStatusDevice()
+    } else {
+        deleteStatusDevice()
     }
 
     unschedule()
@@ -882,7 +898,7 @@ def pollBubbleStatus() {
 
     try {
         if (enableDebugLogging) log.debug "📡 Polling Bubble status…"
-        
+
         Map respMap
         httpPost([
             uri: BUBBLE_STATUS_URL,
@@ -895,11 +911,76 @@ def pollBubbleStatus() {
 
         Map body = _bubbleBody(respMap)
         state.sfpLastStatus = body
-        
+
         if (enableDebugLogging) {
-            log.debug "✅ Bubble status: runtime=${body.runtime_hours_since_install}h, filter_life=${body.filter_life_percentage}%"
+            log.debug "✅ Bubble status: filterHealth=${body.filterHealth}%, minutesActive=${body.minutesActive}"
         }
+
+        // Update child status device if it exists
+        updateStatusDevice(body)
+
     } catch (Exception e) {
         log.error "❌ Bubble status poll failed: ${e.message}"
+    }
+}
+
+/* ============================== STATUS DEVICE MANAGEMENT ============================== */
+
+private def getStatusDevice() {
+    String dni = "sfp-status-${app.id}"
+    return getChildDevice(dni)
+}
+
+def createStatusDevice() {
+    String dni = "sfp-status-${app.id}"
+    def existing = getChildDevice(dni)
+
+    if (existing) {
+        log.info "📊 Status device already exists: ${existing.displayName}"
+        return existing
+    }
+
+    try {
+        String label = "SmartFilterPro Status${state.sfpHvacName ? ' - ' + state.sfpHvacName : ''}"
+        def device = addChildDevice("smartfilterpro", "SmartFilterPro Status Sensor", dni, [
+            label: label,
+            isComponent: false
+        ])
+        log.info "✅ Created status device: ${label}"
+
+        // Immediately update with current status if available
+        if (state.sfpLastStatus) {
+            updateStatusDevice(state.sfpLastStatus)
+        }
+
+        return device
+    } catch (Exception e) {
+        log.error "❌ Failed to create status device: ${e.message}"
+        return null
+    }
+}
+
+def deleteStatusDevice() {
+    String dni = "sfp-status-${app.id}"
+    def existing = getChildDevice(dni)
+
+    if (existing) {
+        try {
+            deleteChildDevice(dni)
+            log.info "🗑️ Deleted status device"
+            return true
+        } catch (Exception e) {
+            log.error "❌ Failed to delete status device: ${e.message}"
+            return false
+        }
+    }
+    return true
+}
+
+private void updateStatusDevice(Map status) {
+    def device = getStatusDevice()
+    if (device && status) {
+        device.updateStatus(status)
+        if (enableDebugLogging) log.debug "📊 Updated status device with: filterHealth=${status.filterHealth}, minutesActive=${status.minutesActive}"
     }
 }
