@@ -1,21 +1,37 @@
 metadata {
     definition(name: "SmartFilterPro Reset Button", namespace: "smartfilterpro", author: "Eric Hanfman") {
         capability "Actuator"
-        capability "PushableButton"   // single, standard button capability
+        capability "PushableButton"
         attribute "lastReset", "STRING"
     }
 }
 
-def installed() { sendEvent(name: "numberOfButtons", value: 1) }
-def updated()   { sendEvent(name: "numberOfButtons", value: 1) }
+def installed() {
+    log.info "SmartFilterPro Reset Button installed"
+    sendEvent(name: "numberOfButtons", value: 1)
+}
+
+def updated() {
+    log.info "SmartFilterPro Reset Button updated"
+    sendEvent(name: "numberOfButtons", value: 1)
+}
 
 // Hubitat will call this for Dashboard/Button and Rule Machine
 def push(Integer buttonNumber = 1) {
-    parent?.resetNow()
-    sendEvent(name: "pushed", value: buttonNumber, isStateChange: true)
-    sendEvent(name: "lastReset", value: new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone))
+    log.info "Reset button pushed - calling parent.resetNow()"
+
+    def result = parent?.resetNow()
+
+    if (result) {
+        log.info "✅ Filter reset successful"
+        sendEvent(name: "pushed", value: buttonNumber, isStateChange: true)
+        sendEvent(name: "lastReset", value: new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone))
+    } else {
+        log.warn "⚠️ Filter reset may have failed - check parent app logs"
+        sendEvent(name: "pushed", value: buttonNumber, isStateChange: true)
+    }
 }
 
-// Optional: keep these if you want to use the Switch tile instead of Button
+// Allow use as Switch tile (Dashboard compatibility)
 def on()  { push(1) }
-def off() { }   // no-op
+def off() { }
