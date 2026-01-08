@@ -587,10 +587,13 @@ def handleEvent(evt) {
     // Calculate runtime if transitioning (with debounce to prevent double-posting)
     Integer runtimeSeconds = null
     if (equipmentModeChanged && wasActive && state[keyStart] && !recentlyPostedRuntime) {
+        // Set debounce timestamp FIRST to "claim" this runtime calculation
+        // This prevents concurrent events from also calculating runtime
+        state[keyLastRuntimePost] = now()
+
         Long start = (state[keyStart] as Long)
         if (start) {
             runtimeSeconds = Math.max(0L, ((now() - start) / 1000L) as int)
-            state[keyLastRuntimePost] = now()  // Mark runtime post time for debounce
             if (enableDebugLogging) log.debug "⏱️ Runtime calculated: ${runtimeSeconds}s (was ${lastEquipmentStatus})"
         }
     } else if (recentlyPostedRuntime && equipmentModeChanged && wasActive) {
@@ -601,15 +604,16 @@ def handleEvent(evt) {
     if (isActive && !wasActive) {
         state[keyStart] = now()
         if (enableDebugLogging) log.debug "🏁 Session START: ${equipmentStatus}"
-        
+
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-        
+
+        // Update state BEFORE posting to prevent race conditions with concurrent events
         state[keyWas] = true
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-        
+
         _postToCoreWithJwt(payload)
         return
     }
@@ -624,16 +628,18 @@ def handleEvent(evt) {
             return
         }
 
+        // Clear session start and update state BEFORE posting to prevent race conditions
+        // This ensures concurrent events see the updated state immediately
         state.remove(keyStart)
+        state[keyWas] = false
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+
         if (enableDebugLogging) log.debug "🛑 Session END: ${lastEquipmentStatus} -> Idle (runtime=${runtimeSeconds}s)"
 
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-
-        state[keyWas] = false
-        state[keyLastType] = equipmentStatus
-        state[keyLastThermostatMode] = thermostatMode
 
         _postToCoreWithJwt(payload)
         return
@@ -648,16 +654,17 @@ def handleEvent(evt) {
             return
         }
 
+        // Update state BEFORE posting to prevent race conditions with concurrent events
         state[keyStart] = now()
+        state[keyWas] = true
+        state[keyLastType] = equipmentStatus
+        state[keyLastThermostatMode] = thermostatMode
+
         if (enableDebugLogging) log.debug "🔄 Equipment mode switch: ${lastEquipmentStatus} → ${equipmentStatus} (runtime=${runtimeSeconds}s)"
 
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-
-        state[keyWas] = true
-        state[keyLastType] = equipmentStatus
-        state[keyLastThermostatMode] = thermostatMode
 
         _postToCoreWithJwt(payload)
         return
@@ -666,15 +673,16 @@ def handleEvent(evt) {
     // State-changing event while active (fan mode changed, etc.)
     if (isActive && isStateChangingEvent && !equipmentModeChanged) {
         if (enableDebugLogging) log.debug "🔄 State change: ${evt.name} changed to ${evt.value}"
-        
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-        
+
+        // Update state BEFORE posting to prevent race conditions with concurrent events
         state[keyWas] = true
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-        
+
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+
         _postToCoreWithJwt(payload)
         return
     }
@@ -682,15 +690,16 @@ def handleEvent(evt) {
     // State-changing event while inactive
     if (!isActive && isStateChangingEvent && !equipmentModeChanged) {
         if (enableDebugLogging) log.debug "🔄 State change while idle: ${evt.name} changed to ${evt.value}"
-        
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-        
+
+        // Update state BEFORE posting to prevent race conditions with concurrent events
         state[keyWas] = false
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-        
+
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
+
         _postToCoreWithJwt(payload)
         return
     }
