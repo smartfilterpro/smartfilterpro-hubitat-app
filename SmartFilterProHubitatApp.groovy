@@ -435,19 +435,20 @@ def checkDeviceHealth() {
     if (wasReachable != isReachable) {
         log.warn "⚠️ Device reachability changed: ${wasReachable} → ${isReachable}"
         state.lastKnownReachable = isReachable
-        
+
         // Send a status update to Core
         if (state.sfpAccessToken) {
             String op = settings.thermostat.currentThermostatOperatingState ?: "idle"
             String fanMode = settings.thermostat.currentThermostatFanMode ?: "auto"
             String equipmentStatus = classifyState(op, fanMode, false)
-            
+
             Map payload = buildCoreEventFromDevice(
-                settings.thermostat, 
-                "Telemetry_Update",  // ✅ Event type (what kind of event)
-                null, 
-                equipmentStatus,     // ✅ Equipment status (what equipment is doing)
-                isReachable
+                settings.thermostat,
+                "Telemetry_Update",  // Event type
+                null,                // runtimeSeconds
+                equipmentStatus,     // Equipment status
+                null,                // overrideIsActive (use default)
+                isReachable          // overrideIsReachable
             )
             _postToCoreWithJwt(payload)
         }
@@ -696,7 +697,7 @@ def handleEvent(evt) {
 }
 /* ============================== PAYLOAD BUILDER - 8-STATE SYSTEM ============================== */
 
-private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeSeconds = null, String equipmentStatus = null, Boolean overrideIsActive = null) {
+private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeSeconds = null, String equipmentStatus = null, Boolean overrideIsActive = null, Boolean overrideIsReachable = null) {
     String userId = state.sfpUserId
     String deviceId = dev.getId().toString()
     String label = dev.label ?: dev.displayName ?: dev.name
@@ -712,8 +713,9 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     def rawAttrs = [:]
     dev.supportedAttributes.each { a -> rawAttrs[a.name] = dev.currentValue(a.name) }
 
-    // Check if device is reachable
-    boolean isReachable = checkDeviceReachable(dev)
+    // Default to true (if we're sending an event, we have data from the device)
+    // Allow override for health check scenarios
+    boolean isReachable = (overrideIsReachable != null) ? overrideIsReachable : true
 
     String ts = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location?.timeZone ?: TimeZone.getTimeZone("UTC"))
 
