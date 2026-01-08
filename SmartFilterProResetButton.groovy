@@ -17,8 +17,9 @@ def updated() {
 }
 
 // Hubitat will call this for Dashboard/Button and Rule Machine
-def push(Integer buttonNumber = 1) {
-    log.info "Reset button pushed - calling parent.resetNow()"
+// Note: No type on parameter - Hubitat may pass Integer or BigDecimal
+def push(buttonNumber = 1) {
+    log.info "Reset button pushed (button ${buttonNumber}) - calling parent.resetNow()"
 
     def result = parent?.resetNow()
 
