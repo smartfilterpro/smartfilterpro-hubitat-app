@@ -330,15 +330,25 @@ def cloudLogin() {
         state.sfpCoreToken    = body.core_token
         state.sfpCoreTokenExp = body.expires_at
 
-        // HVAC map
+        // HVAC map - handle both single and multiple thermostats
         Map choices = [:]
-        List ids = body.hvac_id instanceof List ? body.hvac_id : [body.hvac_id]
-        List names = body.hvac_name instanceof List ? body.hvac_name : []
-        ids.eachWithIndex { id, idx -> if (id) choices[id] = names[idx] ?: id }
+        List ids = body.hvac_id instanceof List ? body.hvac_id : (body.hvac_id ? [body.hvac_id] : [])
+        List names = body.hvac_name instanceof List ? body.hvac_name : (body.hvac_name ? [body.hvac_name] : [])
+
+        ids.eachWithIndex { id, idx ->
+            if (id) {
+                // Safely get name, fall back to id if index out of bounds or null
+                String name = (idx < names.size() && names[idx]) ? names[idx].toString() : id.toString()
+                choices[id.toString()] = name
+            }
+        }
         state.sfpHvacChoices = choices
+
         if (choices.size() == 1) {
             state.sfpHvacId = choices.keySet().first()
             state.sfpHvacName = choices.values().first()
+        } else if (choices.size() > 1) {
+            log.info "📋 Multiple HVACs found: ${choices}"
         }
 
         app.updateSetting("loginPassword", [type:"password", value:""])
