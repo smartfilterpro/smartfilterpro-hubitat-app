@@ -140,15 +140,17 @@ def linkPage() {
 
 def selectHvacPage() {
     dynamicPage(name: "selectHvacPage", title: "Select HVAC", install: false, uninstall: false) {
-        Map opts = (state.sfpHvacChoices ?: [:])
-        input "chosenHvac", "enum", title: "Thermostat", required: true,
-              options: opts, submitOnChange: true
-        if (settings.chosenHvac) {
-            String id = settings.chosenHvac.toString()
-            paragraph "Selected: ${opts[id] ?: id}"
-            href "chooseHvac", title: "Save Selection",
-                 style: "external",
-                 url: "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
+        section("Choose Thermostat") {
+            Map opts = (state.sfpHvacChoices ?: [:])
+            input "chosenHvac", "enum", title: "Thermostat", required: true,
+                  options: opts, submitOnChange: true
+            if (settings.chosenHvac) {
+                String id = settings.chosenHvac.toString()
+                paragraph "Selected: ${opts[id] ?: id}"
+                href "chooseHvac", title: "Save Selection",
+                     style: "external",
+                     url: "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
+            }
         }
     }
 }
