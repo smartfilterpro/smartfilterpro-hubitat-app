@@ -117,12 +117,19 @@ def linkPage() {
                  url: "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
         }
 
-        if (state.lastLoginError)
+        if (state.lastLoginError) {
             section("Last Error") { paragraph "${state.lastLoginError}" }
+        }
 
-        if (state.sfpHvacChoices && (state.sfpHvacChoices as Map).size() > 1 && !state.sfpHvacId)
-            href "selectHvacPage", title: "Select HVAC",
-                 description: "Multiple thermostats found. Pick one."
+        if (state.sfpHvacChoices && state.sfpHvacId == null) {
+            def choices = state.sfpHvacChoices
+            if (choices instanceof Map && choices.size() > 1) {
+                section("Select Thermostat") {
+                    href "selectHvacPage", title: "Select HVAC",
+                         description: "Multiple thermostats found (${choices.size()}). Pick one."
+                }
+            }
+        }
     }
 }
 
