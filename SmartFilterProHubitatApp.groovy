@@ -121,14 +121,19 @@ def linkPage() {
             section("Last Error") { paragraph "${state.lastLoginError}" }
         }
 
-        if (state.sfpHvacChoices && state.sfpHvacId == null) {
+        // Show HVAC selection if multiple thermostats and none selected yet
+        try {
             def choices = state.sfpHvacChoices
-            if (choices instanceof Map && choices.size() > 1) {
+            def hvacId = state.sfpHvacId
+            if (choices != null && hvacId == null && choices instanceof Map && choices.size() > 1) {
                 section("Select Thermostat") {
                     href "selectHvacPage", title: "Select HVAC",
                          description: "Multiple thermostats found (${choices.size()}). Pick one."
                 }
             }
+        } catch (Exception e) {
+            log.error "Error rendering HVAC selection: ${e.message}"
+            section("Error") { paragraph "Error loading HVAC choices. Please re-authenticate." }
         }
     }
 }
