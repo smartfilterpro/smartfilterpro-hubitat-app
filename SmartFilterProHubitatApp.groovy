@@ -18,11 +18,11 @@ import groovy.transform.Field
 /* ============================== CONSTANTS ============================== */
 
 @Field static final String CORE_INGEST_URL = "https://core.smartfilter.com/ingest/v1/events:batch"
-@Field static final String BUBBLE_LOGIN_URL = "https://smartfilterpro.com/version-test/api/1.1/wf/hubitat_password"
-@Field static final String BUBBLE_REFRESH_URL = "https://smartfilterpro.com/version-test/api/1.1/wf/hubitat_refresh_token"
-@Field static final String BUBBLE_CORE_JWT_URL = "https://smartfilterpro.com/version-test/api/1.1/wf/issue_core_token_hub"
-@Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/version-test/api/1.1/wf/hubitat_therm_status"
-@Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/version-test/api/1.1/wf/hubitat_reset_filter"
+@Field static final String BUBBLE_LOGIN_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_password"
+@Field static final String BUBBLE_REFRESH_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_refresh_token"
+@Field static final String BUBBLE_CORE_JWT_URL = "https://smartfilterpro.com/api/1.1/wf/issue_core_token_hub"
+@Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
+@Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
 @Field static final Integer TOKEN_SKEW_SECONDS = 60
