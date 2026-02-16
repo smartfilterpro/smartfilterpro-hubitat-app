@@ -394,11 +394,21 @@ private Map _bubbleBody(Map resp) {
 
 def installed() {
     log.info "SmartFilterPro Bridge installed"
+    // Initialize sequence counter for gap detection
+    if (state.sequenceNumber == null) {
+        state.sequenceNumber = 0
+        log.info "Initialized sequence counter to 0"
+    }
     initialize()
 }
 
 def updated()  {
     log.info "SmartFilterPro Bridge updated"
+    // Initialize sequence counter if not present
+    if (state.sequenceNumber == null) {
+        state.sequenceNumber = 0
+        log.info "Initialized sequence counter to 0"
+    }
     unsubscribe()
     unschedule()
     initialize()
@@ -802,6 +812,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         equipment_status: finalEquipStatus,  // Use 8-state value
         is_active: finalIsActive,
         runtime_seconds: runtimeSeconds,
+        sequence_number: getNextSequenceNumber(),
         timestamp: ts,
         recorded_at: ts,
         observed_at: ts,
@@ -860,6 +871,10 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
             }
             if (resp.status >= 200 && resp.status < 300) {
                 log.info "✅ Core POST OK (${resp.status}) - ${requestBody.size()} event(s) sent"
+
+                // Increment sequence number after successful post
+                incrementSequenceNumber()
+
                 if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
                 success = true
             } else {
@@ -1110,6 +1125,29 @@ def deleteResetDevice() {
         }
     }
     return true
+}
+
+/* ============================== SEQUENCE NUMBER HELPERS ============================== */
+
+/**
+ * Get the next sequence number for event posting
+ * Returns the current sequence number (will be incremented after successful post)
+ */
+private Integer getNextSequenceNumber() {
+    if (state.sequenceNumber == null) {
+        state.sequenceNumber = 0
+    }
+    return state.sequenceNumber
+}
+
+/**
+ * Increment the sequence number after successful event post
+ * Called only after Core returns 200/201
+ */
+private void incrementSequenceNumber() {
+    def current = state.sequenceNumber ?: 0
+    state.sequenceNumber = current + 1
+    logDebug "📊 Incremented sequence number: ${current} → ${state.sequenceNumber}"
 }
 
 /* ============================== FILTER RESET ============================== */
