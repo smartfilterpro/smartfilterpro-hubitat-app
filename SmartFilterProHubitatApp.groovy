@@ -547,32 +547,28 @@ def checkDeviceHealth() {
 private String classifyState(String operatingState, String fanMode, boolean checkAuxHeat = true) {
     String op = (operatingState ?: "idle").toLowerCase()
     String fan = (fanMode ?: "auto").toLowerCase()
-    
+
     boolean coolingActive = op.contains("cool")
     boolean heatingActive = op.contains("heat")
     boolean fanExplicitlyOn = (fan in ["on", "circulate"])
     boolean fanOnlyMode = (op == "fan only")
-    
+
     // Check for auxiliary/emergency heat
     // Hubitat may report this in operatingState or we check thermostatMode
     boolean isAuxHeat = checkAuxHeat && (op.contains("emergency") || op.contains("aux"))
-    
-    if (isAuxHeat && fanExplicitlyOn) {
+
+    // Residential forced-air systems always run the fan during heating/cooling,
+    // so default to _Fan variants for accurate runtime tracking
+    if (isAuxHeat) {
         return "AuxHeat_Fan"
-    } else if (isAuxHeat) {
-        return "AuxHeat"
-    } else if (coolingActive && fanExplicitlyOn) {
-        return "Cooling_Fan"
     } else if (coolingActive) {
-        return "Cooling"
-    } else if (heatingActive && fanExplicitlyOn) {
-        return "Heating_Fan"
+        return "Cooling_Fan"
     } else if (heatingActive) {
-        return "Heating"
+        return "Heating_Fan"
     } else if (fanOnlyMode || fanExplicitlyOn) {
         return "Fan_only"
     } else {
-        return "Idle"  // ✅ Changed from "Fan_off" to "Idle"
+        return "Idle"
     }
 }
 
@@ -789,13 +785,25 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     String model = dev.getDataValue("model") ?: "Unknown Model"
     String modelNumber = dev.deviceNetworkId ?: "Unknown"
     String op = dev.currentThermostatOperatingState
+    String fanMode = dev.currentThermostatFanMode
     String thermostatMode = dev.currentThermostatMode
     Double temp = dev.currentTemperature
     Double heat = dev.currentHeatingSetpoint
     Double cool = dev.currentCoolingSetpoint
     Double humidity = dev.currentHumidity
-    def rawAttrs = [:]
-    dev.supportedAttributes.each { a -> rawAttrs[a.name] = dev.currentValue(a.name) }
+    def payloadRaw = [
+        version: APP_VERSION,
+        temperature: temp,
+        humidity: humidity,
+        thermostatMode: thermostatMode,
+        thermostatOperatingState: op,
+        thermostatFanMode: fanMode,
+        heatingSetpoint: heat,
+        coolingSetpoint: cool,
+        thermostatSetpoint: dev.currentThermostatSetpoint,
+        supportedThermostatModes: dev.supportedThermostatModes?.toString(),
+        supportedThermostatFanModes: dev.supportedThermostatFanModes?.toString()
+    ]
 
     // Default to true (if we're sending an event, we have data from the device)
     // Allow override for health check scenarios
@@ -834,6 +842,8 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         // Use 8-state boolean flags
         last_mode: thermostatMode,
         thermostat_mode: thermostatMode,
+        thermostatOperatingState: op,
+        thermostatFanMode: fanMode,
         last_is_cooling: isCooling,
         last_is_heating: isHeating,
         last_is_fan_only: isFanOnly,
@@ -857,7 +867,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         timestamp: ts,
         recorded_at: ts,
         observed_at: ts,
-        payload_raw: rawAttrs
+        payload_raw: payloadRaw
     ]
 }
 
