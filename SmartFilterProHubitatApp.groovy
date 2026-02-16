@@ -24,6 +24,9 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
+@Field static final String  APP_VERSION = "1.0.0"
+@Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
+
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
 @Field static final Integer TOKEN_SKEW_SECONDS = 60
 
@@ -52,6 +55,13 @@ preferences {
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "SmartFilterPro (8-State)", install: true, uninstall: true) {
+        if (state.updateAvailable && state.latestVersion) {
+            section("Update Available") {
+                paragraph "<b>Version ${state.latestVersion} is available!</b> You are running ${APP_VERSION}."
+                paragraph "Update via Hubitat Package Manager or download from GitHub."
+            }
+        }
+
         section("Hubitat Thermostat (optional)") {
             input "thermostat", "capability.thermostat",
                   title: "Select Thermostat (optional)", required: false, submitOnChange: true
@@ -101,6 +111,10 @@ def mainPage() {
         section("Status") {
             href "statusPage", title: "View Last Bubble Status (20min poll)",
                  description: "Shows last ha_therm_status from Bubble"
+        }
+
+        section("About") {
+            paragraph "SmartFilterPro v${APP_VERSION}"
         }
     }
 }
@@ -473,7 +487,12 @@ def initialize() {
     schedule("0 0/20 * * * ?", "pollBubbleStatus")
     runIn(5, "pollBubbleStatus")
 
-    log.info "✅ Initialized | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'} | User=${state.sfpUserId ?: '(none)'}"
+    // Check for app updates once daily (at a random minute to spread load)
+    def randomMinute = Math.abs(new Random().nextInt() % 60)
+    schedule("0 ${randomMinute} 3 * * ?", "checkForUpdate")
+    runIn(30, "checkForUpdate")
+
+    log.info "✅ Initialized v${APP_VERSION} | Linked=${!!state.sfpAccessToken} | HVAC=${state.sfpHvacName ?: '(none)'} | User=${state.sfpUserId ?: '(none)'}"
 }
 
 def heartbeat() {
@@ -1036,6 +1055,60 @@ def pollBubbleStatus() {
 
     } catch (Exception e) {
         log.error "❌ Bubble status poll failed: ${e.message}"
+    }
+}
+
+/* ============================== VERSION CHECK ============================== */
+
+/**
+ * Check GitHub for a newer version of the app.
+ * Fetches packageManifest.json and compares version to APP_VERSION.
+ * Stores result in state.updateAvailable and state.latestVersion.
+ */
+def checkForUpdate() {
+    try {
+        logDebug "🔍 Checking for app updates..."
+
+        httpGet([uri: VERSION_CHECK_URL, timeout: 15]) { resp ->
+            if (resp.status == 200) {
+                def manifest = new groovy.json.JsonSlurper().parseText(resp.data.text)
+                String latestVersion = manifest?.version
+
+                if (latestVersion && isNewerVersion(latestVersion, APP_VERSION)) {
+                    state.updateAvailable = true
+                    state.latestVersion = latestVersion
+                    log.info "🆕 Update available: ${APP_VERSION} → ${latestVersion}"
+                } else {
+                    state.updateAvailable = false
+                    state.latestVersion = APP_VERSION
+                    logDebug "✅ App is up to date (${APP_VERSION})"
+                }
+            }
+        }
+    } catch (Exception e) {
+        logDebug "Could not check for updates: ${e.message}"
+        // Don't clear update state on failure - keep previous result
+    }
+}
+
+/**
+ * Compare semantic versions (e.g. "1.1.0" > "1.0.0").
+ * Returns true if remoteVersion is newer than localVersion.
+ */
+private boolean isNewerVersion(String remoteVersion, String localVersion) {
+    try {
+        def remote = remoteVersion.tokenize('.').collect { it as Integer }
+        def local = localVersion.tokenize('.').collect { it as Integer }
+
+        for (int i = 0; i < Math.max(remote.size(), local.size()); i++) {
+            int r = i < remote.size() ? remote[i] : 0
+            int l = i < local.size() ? local[i] : 0
+            if (r > l) return true
+            if (r < l) return false
+        }
+        return false
+    } catch (Exception e) {
+        return false
     }
 }
 
