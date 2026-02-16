@@ -158,7 +158,19 @@ def selectHvacPage() {
 def statusPage() {
     Map shown = state.sfpLastStatus ?: [:]
     def jsonPretty = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(shown))
+
+    def bufferSize = state.eventBuffer?.size() ?: 0
+    def oldestSeq = bufferSize > 0 ? state.eventBuffer?.first()?.event?.sequence_number : null
+    def newestSeq = bufferSize > 0 ? state.eventBuffer?.last()?.event?.sequence_number : null
+
     dynamicPage(name: "statusPage", title: "Last Bubble Status (Polled)", install: false, uninstall: false) {
+        section("Event Buffer") {
+            paragraph "Buffered Events: ${bufferSize}/200"
+            paragraph "Current Sequence: ${state.sequenceNumber ?: 0}"
+            if (bufferSize > 0) {
+                paragraph "Sequence Range: ${oldestSeq} - ${newestSeq}"
+            }
+        }
         section("Polled from ha_therm_status") {
             paragraph "<pre>${jsonPretty}</pre>"
         }
@@ -399,6 +411,11 @@ def installed() {
         state.sequenceNumber = 0
         log.info "Initialized sequence counter to 0"
     }
+    // Initialize event buffer for backfill
+    if (state.eventBuffer == null) {
+        state.eventBuffer = []
+        log.info "Initialized event buffer"
+    }
     initialize()
 }
 
@@ -408,6 +425,11 @@ def updated()  {
     if (state.sequenceNumber == null) {
         state.sequenceNumber = 0
         log.info "Initialized sequence counter to 0"
+    }
+    // Initialize event buffer if not present
+    if (state.eventBuffer == null) {
+        state.eventBuffer = []
+        log.info "Initialized event buffer"
     }
     unsubscribe()
     unschedule()
@@ -851,6 +873,13 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
         body: requestBody
     ]
 
+    // Buffer events before posting (for potential gap backfill) - only on first attempt
+    if (!isRetry) {
+        requestBody.each { evt ->
+            addToEventBuffer(evt)
+        }
+    }
+
     // Debug: Log outgoing request details
     if (enableDebugLogging) {
         log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
@@ -874,6 +903,17 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
 
                 // Increment sequence number after successful post
                 incrementSequenceNumber()
+
+                // Check for gaps in response
+                try {
+                    def jsonResp = resp.data
+                    if (jsonResp?.gaps) {
+                        logDebug "⚠️ Core detected ${jsonResp.gaps.size()} gap(s)"
+                        handleGapResponse(jsonResp.gaps)
+                    }
+                } catch (Exception ge) {
+                    logDebug "Could not parse gap response: ${ge.message}"
+                }
 
                 if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
                 success = true
@@ -1148,6 +1188,120 @@ private void incrementSequenceNumber() {
     def current = state.sequenceNumber ?: 0
     state.sequenceNumber = current + 1
     logDebug "📊 Incremented sequence number: ${current} → ${state.sequenceNumber}"
+}
+
+/* ============================== EVENT BUFFER HELPERS ============================== */
+
+/**
+ * Debug logging helper
+ */
+private void logDebug(String msg) {
+    if (enableDebugLogging) log.debug msg
+}
+
+/**
+ * Add event to buffer (keep last 200)
+ */
+private void addToEventBuffer(Map event) {
+    if (state.eventBuffer == null) {
+        state.eventBuffer = []
+    }
+
+    def bufferedEvent = [
+        event: event,
+        buffered_at: now()
+    ]
+
+    state.eventBuffer.add(bufferedEvent)
+
+    // Keep only last 200 events
+    if (state.eventBuffer.size() > 200) {
+        state.eventBuffer = state.eventBuffer.drop(state.eventBuffer.size() - 200)
+    }
+
+    logDebug "📦 Buffered event (sequence ${event.sequence_number}), buffer size: ${state.eventBuffer.size()}"
+}
+
+/**
+ * Retrieve events from buffer by sequence numbers
+ */
+private List getEventsFromBuffer(List sequences) {
+    if (state.eventBuffer == null || sequences == null || sequences.isEmpty()) {
+        return []
+    }
+
+    def seqSet = sequences.collect { it as Integer } as Set
+    def found = []
+
+    state.eventBuffer.each { buffered ->
+        def seq = buffered.event?.sequence_number
+        if (seq != null && seqSet.contains(seq as Integer)) {
+            found.add(buffered.event)
+        }
+    }
+
+    return found
+}
+
+/**
+ * Handle gaps reported by Core - resend missing events
+ */
+private void handleGapResponse(List gaps) {
+    gaps.each { gap ->
+        def deviceKey = gap.device_key
+        def missingSeqs = gap.missing_sequences
+
+        logDebug "🔍 Core reports gap for ${deviceKey}: missing sequences ${missingSeqs}"
+
+        def foundEvents = getEventsFromBuffer(missingSeqs)
+
+        if (foundEvents.isEmpty()) {
+            log.warn "⚠️ Could not find ${missingSeqs.size()} missing event(s) in buffer"
+            return
+        }
+
+        logDebug "✅ Found ${foundEvents.size()} of ${missingSeqs.size()} missing events in buffer"
+
+        resendBufferedEvents(foundEvents)
+    }
+}
+
+/**
+ * Resend buffered events to Core (for gap backfill)
+ */
+private void resendBufferedEvents(List events) {
+    if (events == null || events.isEmpty()) {
+        return
+    }
+
+    String token = state.sfpCoreToken
+    if (!token) {
+        log.error "Cannot resend events: no Core token"
+        return
+    }
+
+    log.info "🔄 Resending ${events.size()} buffered event(s) to fill gap"
+
+    Map params = [
+        uri: CORE_INGEST_URL,
+        contentType: "application/json",
+        requestContentType: "application/json",
+        headers: [ Authorization: "Bearer ${token}" ],
+        body: events,
+        timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+    ]
+
+    try {
+        httpPostJson(params) { resp ->
+            if (resp.status >= 200 && resp.status < 300) {
+                log.info "✅ Successfully backfilled ${events.size()} event(s)"
+            } else {
+                log.error "❌ Backfill failed (${resp.status})"
+            }
+        }
+    } catch (Exception e) {
+        log.error "❌ Backfill error: ${e.message}"
+    }
 }
 
 /* ============================== FILTER RESET ============================== */
