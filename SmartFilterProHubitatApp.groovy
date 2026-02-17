@@ -17,7 +17,7 @@ import groovy.transform.Field
 
 /* ============================== CONSTANTS ============================== */
 
-@Field static final String CORE_INGEST_URL = "https://core.smartfilter.com/ingest/v1/events:batch"
+@Field static final String CORE_INGEST_URL = "https://core.smartfilterpro.com/ingest/v1/events:batch"
 @Field static final String BUBBLE_LOGIN_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_password"
 @Field static final String BUBBLE_REFRESH_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_refresh_token"
 @Field static final String BUBBLE_CORE_JWT_URL = "https://smartfilterpro.com/api/1.1/wf/issue_core_token_hub"
