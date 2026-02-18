@@ -59,7 +59,7 @@ def updateStatus(Map status) {
         sendEvent(name: "lastUpdated", value: status.lastUpdated)
     }
 
-    def refreshTime = new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone)
+    def refreshTime = new Date().toInstant().toString()
     log.debug "Setting lastRefresh: ${refreshTime}"
     sendEvent(name: "lastRefresh", value: refreshTime)
 
