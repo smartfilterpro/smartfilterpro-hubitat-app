@@ -809,7 +809,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     // Allow override for health check scenarios
     boolean isReachable = (overrideIsReachable != null) ? overrideIsReachable : true
 
-    String ts = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", location?.timeZone ?: TimeZone.getTimeZone("UTC"))
+    String ts = new Date().toInstant().toString()
 
     // Use 8-state equipment status
 	String finalEquipStatus = equipmentStatus ?: eventType ?: "Idle"  // Changed from "Fan_off"

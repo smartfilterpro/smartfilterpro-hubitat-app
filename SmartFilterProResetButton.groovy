@@ -26,7 +26,7 @@ def push(buttonNumber = 1) {
     if (result) {
         log.info "✅ Filter reset successful"
         sendEvent(name: "pushed", value: buttonNumber, isStateChange: true)
-        sendEvent(name: "lastReset", value: new Date().format("yyyy-MM-dd HH:mm:ss", location?.timeZone))
+        sendEvent(name: "lastReset", value: new Date().toInstant().toString())
     } else {
         log.warn "⚠️ Filter reset may have failed - check parent app logs"
         sendEvent(name: "pushed", value: buttonNumber, isStateChange: true)
