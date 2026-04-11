@@ -24,7 +24,7 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.0"
+@Field static final String  APP_VERSION = "1.0.1"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
