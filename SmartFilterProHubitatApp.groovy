@@ -30,6 +30,13 @@ import groovy.transform.Field
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
 @Field static final Integer TOKEN_SKEW_SECONDS = 60
 
+// Dedup window for Mode_Change events. Multiple overlapping thermostat
+// attribute subscriptions (thermostatOperatingState, thermostatFanMode, etc.)
+// can all fire within a few milliseconds for a single physical transition.
+// We drop any Mode_Change whose equipment_status matches the most recently
+// posted Mode_Change within this window.
+@Field static final Long MODE_CHANGE_DEDUP_WINDOW_MS = 3000L
+
 /* ============================== METADATA ============================== */
 
 definition(
@@ -574,6 +581,42 @@ private String classifyState(String operatingState, String fanMode, boolean chec
 
 /* ============================== RUNTIME / EVENTS ============================== */
 
+/**
+ * Claim a Mode_Change post slot for the given equipment_status.
+ *
+ * Returns true if the caller should proceed with posting (no recent duplicate),
+ * false if a Mode_Change with the same equipment_status was already posted
+ * within MODE_CHANGE_DEDUP_WINDOW_MS.
+ *
+ * Uses atomicState so concurrent handlers (multiple thermostat attribute
+ * events firing within milliseconds of each other) see each other's writes
+ * immediately and cannot both pass the dedup check.
+ */
+private boolean _claimModeChangeSlot(String equipmentStatus) {
+    String uid = state.sfpUserId
+    String devId = settings.thermostat?.getId()?.toString()
+    if (!uid || !devId) return true   // Can't dedup without keys; fail open
+
+    String keyLastType = "lastModeChangePostType_${uid}-${devId}"
+    String keyLastTime = "lastModeChangePostTime_${uid}-${devId}"
+
+    String lastType = atomicState[keyLastType]
+    Long lastTime   = (atomicState[keyLastTime] as Long) ?: 0L
+    Long nowMs      = now()
+
+    if (lastType == equipmentStatus && (nowMs - lastTime) < MODE_CHANGE_DEDUP_WINDOW_MS) {
+        if (enableDebugLogging) {
+            log.debug "⏭️ Dedup: skipping duplicate Mode_Change (${equipmentStatus}) — last posted ${nowMs - lastTime}ms ago"
+        }
+        return false
+    }
+
+    // Claim the slot BEFORE posting so a concurrent handler sees it.
+    atomicState[keyLastType] = equipmentStatus
+    atomicState[keyLastTime] = nowMs
+    return true
+}
+
 def handleEvent(evt) {
     if (enableDebugLogging)
         log.debug "🔔 Event received: ${evt.name} = ${evt.value} from ${evt.displayName}"
@@ -631,12 +674,16 @@ def handleEvent(evt) {
     if (thermostatModeChanged && !equipmentModeChanged && !isStateChangingEvent) {
         if (enableDebugLogging) log.debug "📊 Thermostat mode changed (${lastThermostatMode} → ${thermostatMode})"
 
+        state[keyLastThermostatMode] = thermostatMode
+
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
+
         // ✅ Use "Mode_Change" for event_type, but current state for equipment_status
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
-
-        state[keyLastThermostatMode] = thermostatMode
 
         _postToCoreWithJwt(payload)
         return
@@ -676,14 +723,18 @@ def handleEvent(evt) {
         state[keyStart] = now()
         if (enableDebugLogging) log.debug "🏁 Session START: ${equipmentStatus}"
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-
         // Update state BEFORE posting to prevent race conditions with concurrent events
         state[keyWas] = true
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
+
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
+
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        payload.previous_status = lastEquipmentStatus
+        state.sfpLastCorePayload = payload
 
         _postToCoreWithJwt(payload)
         return
@@ -707,6 +758,10 @@ def handleEvent(evt) {
         state[keyLastThermostatMode] = thermostatMode
 
         if (enableDebugLogging) log.debug "🛑 Session END: ${lastEquipmentStatus} -> Idle (runtime=${runtimeSeconds}s)"
+
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
 
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false)
         payload.previous_status = lastEquipmentStatus
@@ -733,6 +788,10 @@ def handleEvent(evt) {
 
         if (enableDebugLogging) log.debug "🔄 Equipment mode switch: ${lastEquipmentStatus} → ${equipmentStatus} (runtime=${runtimeSeconds}s)"
 
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
+
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
@@ -750,6 +809,10 @@ def handleEvent(evt) {
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
 
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
+
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
@@ -766,6 +829,10 @@ def handleEvent(evt) {
         state[keyWas] = false
         state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
+
+        if (!_claimModeChangeSlot(equipmentStatus)) {
+            return
+        }
 
         Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false)
         payload.previous_status = lastEquipmentStatus
