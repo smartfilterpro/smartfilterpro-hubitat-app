@@ -187,9 +187,23 @@ def statusPage() {
     dynamicPage(name: "statusPage", title: "Last Bubble Status (Polled)", install: false, uninstall: false) {
         section("Event Buffer") {
             paragraph "Buffered Events: ${bufferSize}/200"
-            paragraph "Current Sequence: ${state.sequenceNumber ?: 0}"
+            paragraph "Current Sequence: ${atomicState.sequenceNumber ?: 0}"
             if (bufferSize > 0) {
                 paragraph "Sequence Range: ${oldestSeq} - ${newestSeq}"
+            }
+        }
+        section("Outbox (Reliable Delivery)") {
+            Integer outboxDepth = ((atomicState.outbox as List)?.size() ?: 0) as Integer
+            Integer dropCount = (atomicState.outboxDroppedCount ?: 0) as Integer
+            Long lastFlush = atomicState.outboxLastFlushAt as Long
+            String lastResult = atomicState.outboxLastFlushResult ?: "never"
+            Long lastDropAt = atomicState.outboxLastDropAt as Long
+
+            paragraph "Queue depth: ${outboxDepth}/${OUTBOX_MAX_ENTRIES}"
+            paragraph "Last flush: " + (lastFlush ? "${((now() - lastFlush) / 1000L) as Integer}s ago (${lastResult})" : "never")
+            paragraph "Dropped (lifetime): ${dropCount}"
+            if (dropCount > 0 && lastDropAt) {
+                paragraph "Last drop: ${((now() - lastDropAt) / 1000L) as Integer}s ago"
             }
         }
         section("Polled from ha_therm_status") {
@@ -427,11 +441,8 @@ private Map _bubbleBody(Map resp) {
 
 def installed() {
     log.info "SmartFilterPro Bridge installed"
-    // Initialize sequence counter for gap detection
-    if (state.sequenceNumber == null) {
-        state.sequenceNumber = 0
-        log.info "Initialized sequence counter to 0"
-    }
+    // Sequence counter is lazily initialized + migrated by
+    // reserveSequenceNumber() on first use.
     // Initialize event buffer for backfill
     if (state.eventBuffer == null) {
         state.eventBuffer = []
@@ -442,11 +453,8 @@ def installed() {
 
 def updated()  {
     log.info "SmartFilterPro Bridge updated"
-    // Initialize sequence counter if not present
-    if (state.sequenceNumber == null) {
-        state.sequenceNumber = 0
-        log.info "Initialized sequence counter to 0"
-    }
+    // Sequence counter is lazily initialized + migrated by
+    // reserveSequenceNumber() on first use.
     // Initialize event buffer if not present
     if (state.eventBuffer == null) {
         state.eventBuffer = []
@@ -490,6 +498,20 @@ def initialize() {
     unschedule()
     runEvery30Minutes("heartbeat")
     runEvery5Minutes("checkDeviceHealth")
+
+    // Reliable-delivery outbox safety-net timer. Drains any batches
+    // whose nextAttemptAt has elapsed. Fresh POST successes also
+    // trigger a drain via runIn(0) — this timer is the fallback for
+    // when there's no traffic to piggyback on.
+    runEvery1Minute("drainOutbox")
+
+    // Reboot recovery: if the outbox survived from a previous run,
+    // try it once the hub has settled. The runIn(30) delay gives
+    // networking and any other startup activity time to finish.
+    if (atomicState.outbox && (atomicState.outbox as List).size() > 0) {
+        log.warn "📤 [outbox] ${(atomicState.outbox as List).size()} batches pending from previous run, scheduling drain"
+        runIn(30, "drainOutbox")
+    }
 
     schedule("0 0/20 * * * ?", "pollBubbleStatus")
     runIn(5, "pollBubbleStatus")
@@ -930,7 +952,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         equipment_status: finalEquipStatus,  // Use 8-state value
         is_active: finalIsActive,
         runtime_seconds: runtimeSeconds,
-        sequence_number: getNextSequenceNumber(),
+        sequence_number: reserveSequenceNumber(),
         timestamp: ts,
         recorded_at: ts,
         observed_at: ts,
@@ -940,6 +962,22 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
 
 /* ============================== CORE POST / TOKEN ============================== */
 
+/**
+ * Public entrypoint for posting events to Core.
+ *
+ * Responsibilities:
+ *   - Validate / refresh the core_token before trying
+ *   - Buffer each event into state.eventBuffer for gap backfill
+ *     (the ONLY place that calls addToEventBuffer in the fresh path)
+ *   - Call _doCorePost for the actual HTTP work
+ *   - On "ok": handle gaps, schedule a piggyback outbox drain
+ *   - On "permanent": log, bump dropped counter, return false
+ *   - On "transient": enqueue the batch for retry, return false
+ *
+ * Returns true only if the POST actually succeeded. An enqueued
+ * transient failure returns false so callers can still reason about
+ * "did this event reach Core right now" vs. "is it queued."
+ */
 private boolean _postToCoreWithJwt(Object body) {
     if (enableDebugLogging) log.debug "🚀 _postToCoreWithJwt called"
 
@@ -948,17 +986,71 @@ private boolean _postToCoreWithJwt(Object body) {
         return false
     }
 
-    if (enableDebugLogging) log.debug "✅ Core token validated, proceeding with POST"
-    return _postToCoreAttempt(body, false)
+    List batch = (body instanceof List) ? (body as List) : [body]
+
+    // Buffer events on the fresh path only. Outbox drain retries
+    // call _doCorePost directly and skip buffering, so this is the
+    // sole entry point into addToEventBuffer.
+    batch.each { addToEventBuffer(it as Map) }
+
+    if (enableDebugLogging) {
+        log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
+        log.debug "📤 Body (${batch.size()} events):"
+        batch.each { evt ->
+            log.debug "   → device_key: ${evt.device_key}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, sequence=${evt.sequence_number}"
+        }
+    }
+
+    Map result = _doCorePost(batch, false)
+
+    if (result.kind == "ok") {
+        log.info "✅ Core POST OK (${result.status}) — ${batch.size()} event(s)"
+        try {
+            if (result.data?.gaps) {
+                logDebug "⚠️ Core detected ${result.data.gaps.size()} gap(s)"
+                handleGapResponse(result.data.gaps as List)
+            }
+        } catch (Exception ge) {
+            logDebug "Could not parse gap response: ${ge.message}"
+        }
+        // Piggyback drain via runIn(0) instead of a direct call so we
+        // yield to Hubitat's scheduler. Prevents re-entrancy (drain
+        // can't call back into _postToCoreWithJwt while we're still
+        // inside the current handler's HTTP callback) and gives the
+        // drain its own try/catch envelope.
+        if (atomicState.outbox && (atomicState.outbox as List).size() > 0) {
+            runIn(0, "drainOutbox")
+        }
+        return true
+    }
+
+    if (result.kind == "permanent") {
+        log.error "❌ Core permanent error (${result.reason}) — dropping ${batch.size()} event(s): ${result.error}"
+        bumpOutboxDroppedCount()
+        return false
+    }
+
+    // Transient: enqueue for retry.
+    log.warn "⚠️ Core transient error (${result.reason}) — enqueueing ${batch.size()} event(s) to outbox"
+    enqueueOutbox(batch, (result.reason as String) ?: "transient")
+    return false
 }
 
-private boolean _postToCoreAttempt(Object body, boolean isRetry) {
+/**
+ * Pure HTTP POST to Core. No side effects on buffer, outbox, or
+ * sequence counter. Handles its own 401-refresh internally, bounded
+ * to a single recursion via the isRetry flag.
+ *
+ * Result shape (matched on .kind as an exact string literal):
+ *   [kind: "ok",        status: Integer, data: Object]
+ *   [kind: "permanent", reason: String,  error: String]
+ *   [kind: "transient", reason: String,  error: String]
+ */
+private Map _doCorePost(List batch, boolean isRetry) {
     String token = state.sfpCoreToken ?: ""
     Integer timeoutSec = (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT) as Integer
 
     if (isRetry) log.info "🔄 RETRY: Attempting Core post with refreshed token..."
-
-    def requestBody = body instanceof List ? body : [body]
 
     Map params = [
         uri: CORE_INGEST_URL,
@@ -966,73 +1058,49 @@ private boolean _postToCoreAttempt(Object body, boolean isRetry) {
         requestContentType: "application/json",
         timeout: timeoutSec,
         headers: [ Authorization: "Bearer ${token}" ],
-        body: requestBody
+        body: batch
     ]
 
-    // Buffer events before posting (for potential gap backfill) - only on first attempt
-    if (!isRetry) {
-        requestBody.each { evt ->
-            addToEventBuffer(evt)
-        }
-    }
-
-    // Debug: Log outgoing request details
-    if (enableDebugLogging) {
-        log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
-        log.debug "📤 Token present: ${token ? 'yes (' + token.take(20) + '...)' : 'NO TOKEN'}"
-        log.debug "📤 Timeout: ${timeoutSec}s"
-        log.debug "📤 Body (${requestBody.size()} events):"
-        requestBody.each { evt ->
-            log.debug "   → device_key: ${evt.device_key}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, runtime_seconds: ${evt.runtime_seconds}"
-        }
-    }
-
-    boolean success = false
     try {
+        int status = 0
+        def respData = null
         httpPost(params) { resp ->
+            status = resp.status
+            respData = resp.data
             if (enableDebugLogging) {
                 log.debug "📥 Core response status: ${resp.status}"
                 log.debug "📥 Core response data: ${resp.data}"
             }
-            if (resp.status >= 200 && resp.status < 300) {
-                log.info "✅ Core POST OK (${resp.status}) - ${requestBody.size()} event(s) sent"
-
-                // Increment sequence number after successful post
-                incrementSequenceNumber()
-
-                // Check for gaps in response
-                try {
-                    def jsonResp = resp.data
-                    if (jsonResp?.gaps) {
-                        logDebug "⚠️ Core detected ${jsonResp.gaps.size()} gap(s)"
-                        handleGapResponse(jsonResp.gaps)
-                    }
-                } catch (Exception ge) {
-                    logDebug "Could not parse gap response: ${ge.message}"
-                }
-
-                if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
-                success = true
-            } else {
-                log.warn "⚠️ Core returned non-OK status: ${resp.status}, data: ${resp.data}"
-                success = false
-            }
         }
-        return success
+        if (status >= 200 && status < 300) {
+            if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
+            return [kind: "ok", status: status, data: respData]
+        }
+        // Non-2xx that somehow didn't throw. Treat as transient so
+        // the outbox retries — if it's actually a permanent client
+        // error, the next attempt will throw and reclassify.
+        log.warn "⚠️ Core returned non-2xx without throwing: ${status}"
+        return [kind: "transient", reason: "non_2xx_${status}", error: "status=${status}"]
     } catch (Exception e) {
-        log.error "❌ Core post exception: ${e.message}"
-        log.error "❌ Exception details: ${e}"
-
         String errMsg = e.toString()
         boolean is401 = errMsg.contains("401") || errMsg.toLowerCase().contains("unauthorized")
+        boolean is4xx = _isHttpClientError(errMsg)
 
         if (is401 && !isRetry) {
             log.warn "⚠️ Core 401 — refreshing token and retrying"
             if (_issueCoreTokenOrLog()) {
-                return _postToCoreAttempt(body, true)
+                return _doCorePost(batch, true)
             }
+            return [kind: "permanent", reason: "401_refresh_failed", error: errMsg]
         }
-        return false
+
+        if (is4xx) {
+            log.error "❌ Core 4xx: ${errMsg}"
+            return [kind: "permanent", reason: "4xx", error: errMsg]
+        }
+
+        log.error "❌ Core post exception: ${e.message}"
+        return [kind: "transient", reason: "exception_${e.class.simpleName}", error: errMsg]
     }
 }
 
@@ -1320,24 +1388,36 @@ def deleteResetDevice() {
 /* ============================== SEQUENCE NUMBER HELPERS ============================== */
 
 /**
- * Get the next sequence number for event posting
- * Returns the current sequence number (will be incremented after successful post)
+ * Reserve and advance the sequence number atomically.
+ *
+ * Uses atomicState (not state) so that concurrent handlers see each
+ * other's writes immediately. state is only flushed at handler
+ * return, which allowed two concurrent handlers to both peek the
+ * same value and post events under the same sequence_number. See
+ * _claimModeChangeSlot for the same pattern applied to mode-change
+ * dedup.
+ *
+ * This is not a true compare-and-swap (Hubitat doesn't expose one),
+ * so there's a microsecond-wide TOCTOU window. That's vastly
+ * narrower than the handler-lifetime window that existed before
+ * and is effectively impossible to hit at Hubitat event rates.
+ *
+ * On first call after upgrade from a version that kept the counter
+ * in state, migrate the existing value so sequence numbers don't
+ * reset to zero across the upgrade.
  */
-private Integer getNextSequenceNumber() {
-    if (state.sequenceNumber == null) {
-        state.sequenceNumber = 0
+private Integer reserveSequenceNumber() {
+    if (atomicState.sequenceNumber == null) {
+        Integer migrated = (state.sequenceNumber ?: 0) as Integer
+        atomicState.sequenceNumber = migrated
+        if (state.sequenceNumber != null) {
+            log.info "📊 Migrated sequenceNumber ${state.sequenceNumber} from state to atomicState"
+            state.remove("sequenceNumber")
+        }
     }
-    return state.sequenceNumber
-}
-
-/**
- * Increment the sequence number after successful event post
- * Called only after Core returns 200/201
- */
-private void incrementSequenceNumber() {
-    def current = state.sequenceNumber ?: 0
-    state.sequenceNumber = current + 1
-    logDebug "📊 Incremented sequence number: ${current} → ${state.sequenceNumber}"
+    Integer reserved = (atomicState.sequenceNumber as Integer)
+    atomicState.sequenceNumber = reserved + 1
+    return reserved
 }
 
 /* ============================== EVENT BUFFER HELPERS ============================== */
@@ -1350,11 +1430,24 @@ private void logDebug(String msg) {
 }
 
 /**
- * Add event to buffer (keep last 200)
+ * Add event to buffer (keep last 200).
+ *
+ * After the outbox refactor, _postToCoreWithJwt is the sole caller
+ * of this function on the fresh path, and drainOutbox deliberately
+ * bypasses it on retries. The sequence_number guard below is a
+ * defense-in-depth check: if anything ever re-enters this function
+ * with an event whose sequence is already buffered, we skip the
+ * duplicate so "buffer depth" stays a meaningful metric.
  */
 private void addToEventBuffer(Map event) {
     if (state.eventBuffer == null) {
         state.eventBuffer = []
+    }
+
+    def seq = event?.sequence_number
+    if (seq != null && state.eventBuffer.any { it?.event?.sequence_number == seq }) {
+        logDebug "📦 Skipping duplicate buffer entry for sequence ${seq}"
+        return
     }
 
     def bufferedEvent = [
@@ -1452,6 +1545,203 @@ private void resendBufferedEvents(List events) {
     } catch (Exception e) {
         log.error "❌ Backfill error: ${e.message}"
     }
+}
+
+/* ============================== OUTBOX (RELIABLE DELIVERY) ============================== */
+
+// Bounded retry queue for batches that failed the fresh POST.
+//
+// Works in tandem with state.eventBuffer:
+//   - eventBuffer handles "Core landed it but reports a gap later"
+//     via handleGapResponse / resendBufferedEvents.
+//   - outbox handles "the POST never landed" — network errors,
+//     timeouts, and 5xx from Core.
+//
+// Entries are full batches (List<Map>) as _doCorePost accepts. Drain
+// calls _doCorePost directly and inherits its JWT-refresh path for
+// free. Buffering events is _postToCoreWithJwt's responsibility and
+// happens ONCE per logical event on the fresh attempt, so drain
+// retries don't grow the buffer.
+
+@Field static final Integer OUTBOX_MAX_ENTRIES    = 50
+@Field static final Integer OUTBOX_MAX_ATTEMPTS   = 10
+@Field static final List    OUTBOX_BACKOFF_SECS   = [30, 60, 120, 300, 600, 1800]
+
+/**
+ * Add a failed batch to the outbox.
+ *
+ * Called from _postToCoreWithJwt when _doCorePost returns a
+ * transient result. The event(s) in `batch` are already in
+ * state.eventBuffer from _postToCoreWithJwt's addToEventBuffer
+ * call, so the gap-backfill path will still work even if this
+ * batch eventually hits the attempt cap and gets dropped.
+ *
+ * Drop-newest overflow policy: sequence_number advances at reserve
+ * time, not at POST success. Dropping an older queued entry would
+ * leave a used-but-never-sent sequence number that Core's gap
+ * detector would chase forever. Dropping the newest keeps the
+ * sequence stream's tail contiguous and deterministic: "we stopped
+ * at sequence N, everything ≥ N+k is lost."
+ *
+ * Note: the read-modify-write on atomicState.outbox here is not
+ * truly atomic. Two concurrent failures can lose one enqueue. In
+ * practice failures are rare enough that this is acceptable;
+ * flagged in comments so the next reader doesn't assume otherwise.
+ */
+private Boolean enqueueOutbox(List batch, String reason) {
+    List outbox = (atomicState.outbox ?: []) as List
+
+    if (outbox.size() >= OUTBOX_MAX_ENTRIES) {
+        log.warn "⚠️ [outbox] Full (${outbox.size()}/${OUTBOX_MAX_ENTRIES}), dropping incoming batch (reason=${reason}, events=${batch.size()})"
+        bumpOutboxDroppedCount()
+        return false
+    }
+
+    Long nowMs = now()
+    outbox << [
+        body: batch,
+        firstEnqueuedAt: nowMs,
+        nextAttemptAt: nowMs + ((OUTBOX_BACKOFF_SECS[0] as Long) * 1000L),
+        attemptCount: 1,
+        lastReason: reason
+    ]
+    atomicState.outbox = outbox
+
+    log.warn "📤 [outbox] Enqueued batch (reason=${reason}, events=${batch.size()}, depth=${outbox.size()})"
+    return true
+}
+
+/**
+ * Drain as many outbox entries as possible right now.
+ *
+ * Called:
+ *   - as runIn(0, "drainOutbox") from the 2xx branch of
+ *     _postToCoreWithJwt (piggyback on the fresh POST proving the
+ *     network is back)
+ *   - from runEvery1Minute("drainOutbox") as a safety net
+ *   - from initialize() via runIn(30) on reboot if the outbox
+ *     survived in atomicState from a previous run
+ *
+ * Drain rules:
+ *   - nextAttemptAt > now()                : defer, keep in outbox
+ *   - attemptCount >= OUTBOX_MAX_ATTEMPTS  : drop + bump + CONTINUE
+ *   - _doCorePost "ok"                     : remove, continue draining
+ *   - _doCorePost "permanent" (4xx)        : drop + bump + CONTINUE
+ *   - _doCorePost "transient" (5xx/net)    : reschedule + STOP
+ *
+ * Per-batch 4xx skip is important: one poisoned batch must not
+ * block unrelated batches behind it. But 5xx/network stops the
+ * whole drain because it signals "Core is down, don't hammer it."
+ */
+def drainOutbox() {
+    List outbox = (atomicState.outbox ?: []) as List
+    if (outbox.isEmpty()) {
+        atomicState.outboxLastFlushAt = now()
+        atomicState.outboxLastFlushResult = "empty"
+        return
+    }
+
+    Long nowMs = now()
+    List remaining = []
+    int delivered = 0
+    int deferred  = 0
+    int dropped   = 0
+    int givenUp   = 0
+    boolean stopped = false
+    String stopReason = null
+
+    for (int i = 0; i < outbox.size(); i++) {
+        def entry = outbox[i] as Map
+
+        if (stopped) {
+            // Already hit a transient failure. Append this and all
+            // later entries untouched so they get retried next cycle.
+            remaining << entry
+            continue
+        }
+
+        if ((entry.nextAttemptAt as Long) > nowMs) {
+            remaining << entry
+            deferred++
+            continue
+        }
+
+        if ((entry.attemptCount as Integer) >= OUTBOX_MAX_ATTEMPTS) {
+            log.error "☠️ [outbox] Giving up after ${entry.attemptCount} attempts, events=${(entry.body as List).size()}"
+            bumpOutboxDroppedCount()
+            givenUp++
+            continue
+        }
+
+        Map result
+        try {
+            result = _doCorePost(entry.body as List, false)
+        } catch (Exception e) {
+            log.error "❌ [outbox] Unexpected throw in _doCorePost: ${e.message}"
+            result = [kind: "transient", reason: "uncaught_throw", error: e.message]
+        }
+
+        if (result.kind == "ok") {
+            delivered++
+            // Gap handling is relevant on retry too — Core may detect
+            // a gap in the replayed sequence and ask for backfill.
+            try {
+                if (result.data?.gaps) {
+                    handleGapResponse(result.data.gaps as List)
+                }
+            } catch (Exception ge) {
+                logDebug "Could not parse gap response during drain: ${ge.message}"
+            }
+            continue
+        }
+
+        if (result.kind == "permanent") {
+            log.error "❌ [outbox] Dropping batch due to permanent error (${result.reason}): ${result.error}"
+            bumpOutboxDroppedCount()
+            dropped++
+            continue
+        }
+
+        // Transient: reschedule this entry and stop draining the rest.
+        remaining << scheduleRetry(entry, (result.reason as String) ?: "transient")
+        stopped = true
+        stopReason = (result.reason as String) ?: "transient"
+    }
+
+    atomicState.outbox = remaining
+    atomicState.outboxLastFlushAt = now()
+    atomicState.outboxLastFlushResult = stopped ? "partial" : (remaining.isEmpty() ? "ok" : "partial")
+
+    if (delivered > 0 || givenUp > 0 || dropped > 0 || stopped) {
+        log.info "🧹 [outbox] drain: delivered=${delivered}, dropped=${dropped}, givenUp=${givenUp}, deferred=${deferred}, depth=${remaining.size()}${stopped ? ', stopped=' + stopReason : ''}"
+    }
+}
+
+private Map scheduleRetry(Map entry, String reason) {
+    int attempts = ((entry.attemptCount ?: 0) as Integer) + 1
+    int idx = Math.min(attempts - 1, OUTBOX_BACKOFF_SECS.size() - 1)
+    long base = (OUTBOX_BACKOFF_SECS[idx] as Long) * 1000L
+    long jitterMs = (long)(Math.random() * (base * 0.1))   // up to +10%
+    return [
+        body: entry.body,
+        firstEnqueuedAt: entry.firstEnqueuedAt,
+        nextAttemptAt: now() + base + jitterMs,
+        attemptCount: attempts,
+        lastReason: reason
+    ]
+}
+
+private void bumpOutboxDroppedCount() {
+    atomicState.outboxDroppedCount = ((atomicState.outboxDroppedCount ?: 0) as Integer) + 1
+    atomicState.outboxLastDropAt = now()
+}
+
+private boolean _isHttpClientError(String errMsg) {
+    if (!errMsg) return false
+    // Hubitat's httpPost throws exceptions with the status code
+    // embedded in the message. Match 400-499 excluding 401 (which
+    // is handled separately for token-refresh).
+    return (errMsg =~ /\b4\d{2}\b/) && !errMsg.contains("401")
 }
 
 /* ============================== FILTER RESET ============================== */
