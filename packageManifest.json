@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-02-16",
-  "releaseNotes": "Initial HPM release - 8-state thermostat tracking with sequence numbering and event buffer for gap detection.",
+  "dateReleased": "2026-04-11",
+  "releaseNotes": "Deduplicate Mode_Change events caused by overlapping thermostat attribute subscriptions firing within milliseconds of each other on a single state transition.",
   "communityLink": "",
   "apps": [
     {
