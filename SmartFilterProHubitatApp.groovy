@@ -184,10 +184,17 @@ def statusPage() {
     def oldestSeq = bufferSize > 0 ? state.eventBuffer?.first()?.event?.sequence_number : null
     def newestSeq = bufferSize > 0 ? state.eventBuffer?.last()?.event?.sequence_number : null
 
+    Map seqMap = (atomicState.lastSequenceByDevice as Map) ?: [:]
+    String currentKey = (state.sfpHvacId ?: "").toString()
+    def currentSeq = currentKey ? seqMap[currentKey] : null
+
     dynamicPage(name: "statusPage", title: "Last Bubble Status (Polled)", install: false, uninstall: false) {
         section("Event Buffer") {
             paragraph "Buffered Events: ${bufferSize}/200"
-            paragraph "Current Sequence: ${atomicState.sequenceNumber ?: 0}"
+            paragraph "Current Sequence: ${currentSeq ?: '(uninitialized)'}"
+            if (seqMap.size() > 1) {
+                paragraph "All Device Counters: ${seqMap}"
+            }
             if (bufferSize > 0) {
                 paragraph "Sequence Range: ${oldestSeq} - ${newestSeq}"
             }
@@ -441,8 +448,12 @@ private Map _bubbleBody(Map resp) {
 
 def installed() {
     log.info "SmartFilterPro Bridge installed"
-    // Sequence counter is lazily initialized + migrated by
-    // reserveSequenceNumber() on first use.
+    // Per-device sequence counter (atomicState.lastSequenceByDevice) is
+    // lazily bootstrapped + legacy-migrated by reserveSequenceNumber()
+    // on first use. We deliberately DO NOT touch it here — resetting
+    // it on install/update would reintroduce the sequence-reset bug
+    // that causes Core to silently dedup every subsequent event until
+    // the counter climbs back above its previous high-water mark.
     // Initialize event buffer for backfill
     if (state.eventBuffer == null) {
         state.eventBuffer = []
@@ -453,8 +464,12 @@ def installed() {
 
 def updated()  {
     log.info "SmartFilterPro Bridge updated"
-    // Sequence counter is lazily initialized + migrated by
-    // reserveSequenceNumber() on first use.
+    // Per-device sequence counter (atomicState.lastSequenceByDevice) is
+    // lazily bootstrapped + legacy-migrated by reserveSequenceNumber()
+    // on first use. We deliberately DO NOT touch it here — resetting
+    // it on install/update would reintroduce the sequence-reset bug
+    // that causes Core to silently dedup every subsequent event until
+    // the counter climbs back above its previous high-water mark.
     // Initialize event buffer if not present
     if (state.eventBuffer == null) {
         state.eventBuffer = []
@@ -952,7 +967,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         equipment_status: finalEquipStatus,  // Use 8-state value
         is_active: finalIsActive,
         runtime_seconds: runtimeSeconds,
-        sequence_number: reserveSequenceNumber(),
+        sequence_number: reserveSequenceNumber(state.sfpHvacId),
         timestamp: ts,
         recorded_at: ts,
         observed_at: ts,
@@ -1388,35 +1403,114 @@ def deleteResetDevice() {
 /* ============================== SEQUENCE NUMBER HELPERS ============================== */
 
 /**
- * Reserve and advance the sequence number atomically.
+ * Reserve and advance the sequence number for a given device.
  *
- * Uses atomicState (not state) so that concurrent handlers see each
- * other's writes immediately. state is only flushed at handler
- * return, which allowed two concurrent handlers to both peek the
- * same value and post events under the same sequence_number. See
- * _claimModeChangeSlot for the same pattern applied to mode-change
- * dedup.
+ * Counter is persisted in atomicState.lastSequenceByDevice, a map
+ * keyed by device_key so the counter is scoped to the
+ * (device_key, source_vendor) tuple Core uses as its dedup key:
+ * partial unique index on
+ *   (device_key, source_vendor, payload_raw->>'sequence_number')
+ * (core-ingest migration 024). A single shared counter would
+ * collide as soon as a second device went through this SmartApp.
  *
- * This is not a true compare-and-swap (Hubitat doesn't expose one),
- * so there's a microsecond-wide TOCTOU window. That's vastly
- * narrower than the handler-lifetime window that existed before
- * and is effectively impossible to hit at Hubitat event rates.
+ * Using atomicState (not plain state) means concurrent event handlers
+ * see each other's writes immediately — plain state is only flushed
+ * at handler return, which would otherwise allow two concurrent
+ * handlers to peek the same value and post two events under the same
+ * sequence_number. See _claimModeChangeSlot for the same pattern
+ * applied to mode-change dedup.
  *
- * On first call after upgrade from a version that kept the counter
- * in state, migrate the existing value so sequence numbers don't
- * reset to zero across the upgrade.
+ * Persistence & bootstrap:
+ *   Both state and atomicState survive hub reboots, SmartApp restarts,
+ *   code updates via the Hubitat IDE, and crashes. That's the right
+ *   place for a counter Core relies on being monotonic across all time.
+ *
+ *   On the very first call for a device after this code ships — or
+ *   after the counter was somehow wiped — we MUST NOT reset to 0.
+ *   Core enforces a unique index on
+ *   (device_key, source_vendor, sequence_number), so a counter that
+ *   rolls back causes Core to silently drop every event until the
+ *   counter climbs back above its previous high-water mark. The
+ *   canonical production failure: Core had last_sequence_number=5219,
+ *   the SmartApp restarted and started posting at sequence_number=7,
+ *   every post returned "Inserted 0 events" and the dashboard went
+ *   quiet for hours. See smartfilterpro/core-ingest#217 for the
+ *   observability-only 🔄 [sequence-reset] warning Core added for
+ *   this; Core can't fix it itself without mutating dedup semantics.
+ *
+ *   To guarantee we leap above any prior high-water mark, the
+ *   bootstrap seed is now() — Hubitat's current epoch time in
+ *   milliseconds. That's orders of magnitude larger than any integer
+ *   counter the previous implementation could have produced (Core's
+ *   last_sequence_number for existing devices is a small integer
+ *   like 5219, whereas now() is ~1.8e12), so the first event
+ *   post-upgrade lands well above the largest
+ *   (device_key, 'hubitat', sequence_number) row already in Core.
+ *   Subsequent events increment by exactly 1 so Core's gap-detection
+ *   (handleGapResponse → getEventsFromBuffer) continues to see a
+ *   dense, contiguous tail and doesn't explode the backfill set.
+ *
+ *   A legacy migration floor is also applied: if the old single-counter
+ *   atomicState.sequenceNumber (or even older state.sequenceNumber) is
+ *   present from a previous version, we advance past it as well so we
+ *   never go backwards. The old keys are then cleared so this branch
+ *   is a one-time migration.
+ *
+ * Concurrency: this is not a true compare-and-swap (Hubitat doesn't
+ * expose one), so there's a microsecond-wide TOCTOU window. That's
+ * vastly narrower than the handler-lifetime window that existed
+ * before and is effectively impossible to hit at Hubitat event rates.
  */
-private Integer reserveSequenceNumber() {
-    if (atomicState.sequenceNumber == null) {
-        Integer migrated = (state.sequenceNumber ?: 0) as Integer
-        atomicState.sequenceNumber = migrated
+private Long reserveSequenceNumber(String deviceKey) {
+    // Fallback key. device_key should always be present (state.sfpHvacId),
+    // but if it isn't we still want to produce a monotonic sequence
+    // without crashing the event path.
+    String key = (deviceKey ?: "_unknown")
+
+    // Rebuild the map rather than mutating in place. Hubitat's
+    // atomicState has returned both live references and snapshots
+    // across versions; an explicit put-and-reassign is the only
+    // unambiguous write.
+    Map counters = [:]
+    Map existing = (atomicState.lastSequenceByDevice as Map)
+    if (existing != null) counters.putAll(existing)
+
+    Long current = counters[key] as Long
+
+    Long reserved
+    if (current == null) {
+        // First call for this device since (re)initialization.
+        // Bootstrap above:
+        //   - any legacy single-counter (older versions of this app
+        //     stored the counter in atomicState.sequenceNumber or
+        //     state.sequenceNumber), so upgrades don't go backwards.
+        //   - now() in epoch milliseconds, which guarantees we leap
+        //     above any small-integer high-water mark Core already
+        //     has for this device — the real fix for the reset bug.
+        Long legacyAtomic = (atomicState.sequenceNumber as Long) ?: 0L
+        Long legacyState  = (state.sequenceNumber as Long) ?: 0L
+        Long legacyFloor  = Math.max(legacyAtomic, legacyState)
+        Long nowFloor     = now() as Long
+        reserved = Math.max(nowFloor, legacyFloor + 1L)
+
+        log.info "📊 Bootstrapping sequence counter for device=${key} at ${reserved} (now=${nowFloor}, legacyFloor=${legacyFloor})"
+
+        // One-time cleanup of legacy single-counter keys. Safe because
+        // we've already folded their values into the floor above.
+        if (atomicState.sequenceNumber != null) {
+            log.info "📊 Clearing legacy atomicState.sequenceNumber=${atomicState.sequenceNumber}"
+            atomicState.remove("sequenceNumber")
+        }
         if (state.sequenceNumber != null) {
-            log.info "📊 Migrated sequenceNumber ${state.sequenceNumber} from state to atomicState"
+            log.info "📊 Clearing legacy state.sequenceNumber=${state.sequenceNumber}"
             state.remove("sequenceNumber")
         }
+    } else {
+        reserved = current + 1L
     }
-    Integer reserved = (atomicState.sequenceNumber as Integer)
-    atomicState.sequenceNumber = reserved + 1
+
+    counters[key] = reserved
+    atomicState.lastSequenceByDevice = counters
     return reserved
 }
 
@@ -1445,8 +1539,9 @@ private void addToEventBuffer(Map event) {
     }
 
     def seq = event?.sequence_number
-    if (seq != null && state.eventBuffer.any { it?.event?.sequence_number == seq }) {
-        logDebug "📦 Skipping duplicate buffer entry for sequence ${seq}"
+    Long seqLong = (seq != null) ? (seq as Long) : null
+    if (seqLong != null && state.eventBuffer.any { (it?.event?.sequence_number as Long) == seqLong }) {
+        logDebug "📦 Skipping duplicate buffer entry for sequence ${seqLong}"
         return
     }
 
@@ -1473,12 +1568,14 @@ private List getEventsFromBuffer(List sequences) {
         return []
     }
 
-    def seqSet = sequences.collect { it as Integer } as Set
+    // Coerce to Long throughout — sequence numbers are now bootstrapped
+    // at now() (epoch ms), which overflows Integer.
+    def seqSet = sequences.collect { it as Long } as Set
     def found = []
 
     state.eventBuffer.each { buffered ->
         def seq = buffered.event?.sequence_number
-        if (seq != null && seqSet.contains(seq as Integer)) {
+        if (seq != null && seqSet.contains(seq as Long)) {
             found.add(buffered.event)
         }
     }
