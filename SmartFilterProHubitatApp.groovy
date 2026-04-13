@@ -376,7 +376,7 @@ def debugOnlineStatus() {
     String fan = settings.thermostat.currentThermostatFanMode ?: "auto"
     String equipStatus = classifyState(op, fan, false)
 
-    log.info "   device_key: ${state.sfpHvacId}"
+    log.info "   device_id: ${state.sfpHvacId}"
     log.info "   is_reachable: ${isReachable}"
     log.info "   equipment_status: ${equipStatus}"
     log.info "   temperature_f: ${temp}"
@@ -954,7 +954,6 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     boolean isFanOnly = (finalEquipStatus == "Fan_only")
 
     return [
-        device_key: state.sfpHvacId,
         device_id: state.sfpHvacId,
         workspace_id: userId,
         user_id: userId,
@@ -1040,7 +1039,7 @@ private boolean _postToCoreWithJwt(Object body) {
         log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
         log.debug "📤 Body (${batch.size()} events):"
         batch.each { evt ->
-            log.debug "   → device_key: ${evt.device_key}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, sequence=${evt.sequence_number}"
+            log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, sequence=${evt.sequence_number}"
         }
     }
 
@@ -1434,10 +1433,10 @@ def deleteResetDevice() {
  * Reserve and advance the sequence number for a given device.
  *
  * Counter is persisted in atomicState.lastSequenceByDevice, a map
- * keyed by device_key so the counter is scoped to the
- * (device_key, source_vendor) tuple Core uses as its dedup key:
+ * keyed by device_id so the counter is scoped to the
+ * (device_id, source_vendor) tuple Core uses as its dedup key:
  * partial unique index on
- *   (device_key, source_vendor, payload_raw->>'sequence_number')
+ *   (device_id, source_vendor, payload_raw->>'sequence_number')
  * (core-ingest migration 024). A single shared counter would
  * collide as soon as a second device went through this SmartApp.
  *
@@ -1456,7 +1455,7 @@ def deleteResetDevice() {
  *   On the very first call for a device after this code ships — or
  *   after the counter was somehow wiped — we MUST NOT reset to 0.
  *   Core enforces a unique index on
- *   (device_key, source_vendor, sequence_number), so a counter that
+ *   (device_id, source_vendor, sequence_number), so a counter that
  *   rolls back causes Core to silently drop every event until the
  *   counter climbs back above its previous high-water mark. The
  *   canonical production failure: Core had last_sequence_number=5219,
@@ -1473,7 +1472,7 @@ def deleteResetDevice() {
  *   last_sequence_number for existing devices is a small integer
  *   like 5219, whereas now() is ~1.8e12), so the first event
  *   post-upgrade lands well above the largest
- *   (device_key, 'hubitat', sequence_number) row already in Core.
+ *   (device_id, 'hubitat', sequence_number) row already in Core.
  *   Subsequent events increment by exactly 1 so Core's gap-detection
  *   (handleGapResponse → getEventsFromBuffer) continues to see a
  *   dense, contiguous tail and doesn't explode the backfill set.
@@ -1489,11 +1488,11 @@ def deleteResetDevice() {
  * vastly narrower than the handler-lifetime window that existed
  * before and is effectively impossible to hit at Hubitat event rates.
  */
-private Long reserveSequenceNumber(String deviceKey) {
-    // Fallback key. device_key should always be present (state.sfpHvacId),
+private Long reserveSequenceNumber(String deviceId) {
+    // Fallback key. device_id should always be present (state.sfpHvacId),
     // but if it isn't we still want to produce a monotonic sequence
     // without crashing the event path.
-    String key = (deviceKey ?: "_unknown")
+    String key = (deviceId ?: "_unknown")
 
     // Rebuild the map rather than mutating in place. Hubitat's
     // atomicState has returned both live references and snapshots
@@ -1616,10 +1615,10 @@ private List getEventsFromBuffer(List sequences) {
  */
 private void handleGapResponse(List gaps) {
     gaps.each { gap ->
-        def deviceKey = gap.device_key
+        def deviceId = gap.device_id
         def missingSeqs = gap.missing_sequences
 
-        logDebug "🔍 Core reports gap for ${deviceKey}: missing sequences ${missingSeqs}"
+        logDebug "🔍 Core reports gap for ${deviceId}: missing sequences ${missingSeqs}"
 
         def foundEvents = getEventsFromBuffer(missingSeqs)
 
