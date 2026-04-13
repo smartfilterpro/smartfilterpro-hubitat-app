@@ -589,11 +589,11 @@ def checkDeviceHealth() {
 
             Map payload = buildCoreEventFromDevice(
                 settings.thermostat,
-                "Telemetry_Update",  // Event type
-                null,                // runtimeSeconds
-                equipmentStatus,     // Equipment status
-                null,                // overrideIsActive (use default)
-                isReachable          // overrideIsReachable
+                "CONNECTIVITY_CHANGE",  // Core expects this event_type for online/offline transitions
+                null,                   // runtimeSeconds
+                equipmentStatus,        // Equipment status
+                null,                   // overrideIsActive (use default)
+                isReachable             // overrideIsReachable
             )
             _postToCoreWithJwt(payload)
         }
@@ -1040,7 +1040,7 @@ private boolean _postToCoreWithJwt(Object body) {
         log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
         log.debug "📤 Body (${batch.size()} events):"
         batch.each { evt ->
-            log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, sequence=${evt.sequence_number}"
+            log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, is_reachable: ${evt.is_reachable}, sequence=${evt.sequence_number}"
         }
     }
 
