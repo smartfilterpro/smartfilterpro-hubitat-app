@@ -247,35 +247,48 @@ private String getOrCreateAppToken() {
 
 private boolean checkDeviceReachable(def dev) {
     try {
-        // Method 1: Check device health status (if available)
+        // Method 1: Check deviceAlive attribute (most reliable for Hubitat LAN/cloud devices)
+        def deviceAlive = dev.currentValue("deviceAlive")
+        if (deviceAlive != null) {
+            boolean alive = deviceAlive.toString().toLowerCase() == "true"
+            if (!alive) {
+                if (enableDebugLogging) log.debug "Device ${dev.displayName} has deviceAlive=false"
+                return false
+            }
+            // deviceAlive is true — device is confirmed reachable
+            if (enableDebugLogging) log.debug "Device ${dev.displayName} has deviceAlive=true"
+            return true
+        }
+
+        // Method 2: Check device health status (if available)
         def healthStatus = dev.getStatus()
         if (healthStatus && healthStatus.toLowerCase() == "offline") {
-            if (enableDebugLogging) log.debug "Device ${dev.displayName} is offline"
+            if (enableDebugLogging) log.debug "Device ${dev.displayName} is offline per getStatus()"
             return false
         }
 
-        // Method 2: Check if device has recent activity (within last 2 hours)
+        // Method 3: Check if device has recent activity (within last 24 hours)
         def lastActivity = dev.getLastActivity()
         if (lastActivity) {
             long lastActivityMs = lastActivity.time
-            long twoHoursAgo = now() - (2 * 60 * 60 * 1000)
-            if (lastActivityMs < twoHoursAgo) {
-                if (enableDebugLogging) log.debug "Device ${dev.displayName} hasn't reported in 2+ hours"
+            long twentyFourHoursAgo = now() - (24 * 60 * 60 * 1000)
+            if (lastActivityMs < twentyFourHoursAgo) {
+                if (enableDebugLogging) log.debug "Device ${dev.displayName} hasn't reported in 24+ hours"
                 return false
             }
         }
-        
-        // Method 3: Check if critical attributes are null (might indicate offline)
+
+        // Method 4: Check if critical attributes are null (might indicate offline)
         def temp = dev.currentTemperature
         def state = dev.currentThermostatOperatingState
         if (temp == null && state == null) {
             if (enableDebugLogging) log.warn "Device ${dev.displayName} has null critical attributes"
             return false
         }
-        
+
         // If all checks pass, device is reachable
         return true
-        
+
     } catch (Exception e) {
         log.warn "Error checking device reachability: ${e.message}"
         // Default to true if we can't determine status
@@ -304,11 +317,13 @@ def debugOnlineStatus() {
     def fanMode = settings.thermostat.currentThermostatFanMode
     def lastActivity = settings.thermostat.getLastActivity()
     def healthStatus = settings.thermostat.getStatus()
+    def deviceAlive = settings.thermostat.currentValue("deviceAlive")
 
     log.info "📊 Current Temperature: ${temp}"
     log.info "📊 Operating State: ${opState}"
     log.info "📊 Fan Mode: ${fanMode}"
     log.info "📊 Health Status: ${healthStatus}"
+    log.info "📊 Device Alive: ${deviceAlive}"
     log.info "📊 Last Activity: ${lastActivity}"
 
     // 3. Check what checkDeviceReachable returns
@@ -318,25 +333,33 @@ def debugOnlineStatus() {
     // 4. Check individual reachability conditions
     log.info "--- Reachability Checks ---"
 
-    // Check 1: Health status
+    // Check 1: deviceAlive attribute (most reliable)
+    if (deviceAlive != null) {
+        boolean alive = deviceAlive.toString().toLowerCase() == "true"
+        log.info "   deviceAlive: '${deviceAlive}' (alive=${alive}) — this is the primary check"
+    } else {
+        log.info "   deviceAlive: null (attribute not present, falling through to other checks)"
+    }
+
+    // Check 2: Health status
     if (healthStatus) {
         log.info "   Health status: '${healthStatus}' (offline check: ${healthStatus.toLowerCase() == 'offline'})"
     } else {
         log.info "   Health status: null (skipping check)"
     }
 
-    // Check 2: Last activity time
+    // Check 3: Last activity time
     if (lastActivity) {
         long lastActivityMs = lastActivity.time
-        long twoHoursAgo = now() - (2 * 60 * 60 * 1000)
+        long twentyFourHoursAgo = now() - (24 * 60 * 60 * 1000)
         long minutesAgo = (now() - lastActivityMs) / 60000
-        boolean tooOld = (lastActivityMs < twoHoursAgo)
-        log.info "   Last activity: ${minutesAgo} minutes ago (>2hr check: ${tooOld})"
+        boolean tooOld = (lastActivityMs < twentyFourHoursAgo)
+        log.info "   Last activity: ${minutesAgo} minutes ago (>24hr check: ${tooOld})"
     } else {
         log.info "   Last activity: null (skipping check)"
     }
 
-    // Check 3: Null attributes
+    // Check 4: Null attributes
     boolean bothNull = (temp == null && opState == null)
     log.info "   Null attributes check: temp=${temp}, opState=${opState}, bothNull=${bothNull}"
 
@@ -673,6 +696,9 @@ def handleEvent(evt) {
     String fanMode = dev.currentThermostatFanMode?.toLowerCase() ?: "auto"
     String thermostatMode = dev.currentThermostatMode?.toLowerCase() ?: "auto"
 
+    // Check reachability once per event so every payload carries current status
+    boolean isReachable = checkDeviceReachable(dev)
+
     boolean isStateChangingEvent = (evt.name in ["thermostatOperatingState", "thermostatFanMode"])
 
     String uid = state.sfpUserId
@@ -718,7 +744,7 @@ def handleEvent(evt) {
         }
 
         // ✅ Use "Mode_Change" for event_type, but current state for equipment_status
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -731,7 +757,7 @@ def handleEvent(evt) {
         if (enableDebugLogging) log.debug "📊 Telemetry update (environmental change)"
 
         // ✅ Use "Telemetry_Update" for event_type, but current state for equipment_status
-        Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive)
+        Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -769,7 +795,7 @@ def handleEvent(evt) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -800,7 +826,7 @@ def handleEvent(evt) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -829,7 +855,7 @@ def handleEvent(evt) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -850,7 +876,7 @@ def handleEvent(evt) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -871,7 +897,7 @@ def handleEvent(evt) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
