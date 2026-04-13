@@ -131,8 +131,8 @@ def mainPage() {
 def linkPage() {
     dynamicPage(name: "linkPage", title: "Link SmartFilterPro", install: false, uninstall: false) {
         section("Sign In") {
-            input "loginEmail", "email", title: "Email", required: true
-            input "loginPassword", "password", title: "Password", required: true
+            input "loginEmail", "email", title: "Email", required: true, submitOnChange: true
+            input "loginPassword", "password", title: "Password", required: true, submitOnChange: true
             href name: "doLogin", title: "Authenticate", style: "external",
                  description: "Tap to log in (opens new tab)",
                  url: "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
@@ -442,10 +442,12 @@ def cloudLogin() {
             log.info "📋 Multiple HVACs found: ${choices}"
         }
 
-        app.updateSetting("loginPassword", [type:"password", value:""])
+        app.removeSetting("loginPassword")
+        state.lastLoginError = null
         _html("Login complete. Close this tab and return to the app.")
     } catch (e) {
         log.error "Login error: ${e}"
+        state.lastLoginError = e.toString()
         _html("Login failed: ${e}")
     }
 }
