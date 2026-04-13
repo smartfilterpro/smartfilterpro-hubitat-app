@@ -261,9 +261,10 @@ private boolean checkDeviceReachable(def dev) {
         }
 
         // Method 2: Check device health status (if available)
+        // Hubitat getStatus() returns "ACTIVE" or "INACTIVE" (not "offline")
         def healthStatus = dev.getStatus()
-        if (healthStatus && healthStatus.toLowerCase() == "offline") {
-            if (enableDebugLogging) log.debug "Device ${dev.displayName} is offline per getStatus()"
+        if (healthStatus && healthStatus.toLowerCase() == "inactive") {
+            if (enableDebugLogging) log.debug "Device ${dev.displayName} is INACTIVE per getStatus()"
             return false
         }
 
@@ -280,8 +281,8 @@ private boolean checkDeviceReachable(def dev) {
 
         // Method 4: Check if critical attributes are null (might indicate offline)
         def temp = dev.currentTemperature
-        def state = dev.currentThermostatOperatingState
-        if (temp == null && state == null) {
+        def opState = dev.currentThermostatOperatingState
+        if (temp == null && opState == null) {
             if (enableDebugLogging) log.warn "Device ${dev.displayName} has null critical attributes"
             return false
         }
@@ -343,7 +344,7 @@ def debugOnlineStatus() {
 
     // Check 2: Health status
     if (healthStatus) {
-        log.info "   Health status: '${healthStatus}' (offline check: ${healthStatus.toLowerCase() == 'offline'})"
+        log.info "   Health status: '${healthStatus}' (inactive check: ${healthStatus.toLowerCase() == 'inactive'})"
     } else {
         log.info "   Health status: null (skipping check)"
     }
@@ -572,7 +573,7 @@ def heartbeat() {
 def checkDeviceHealth() {
     if (!settings.thermostat) return
 
-    boolean wasReachable = state.lastKnownReachable ?: true
+    boolean wasReachable = (state.lastKnownReachable != null) ? state.lastKnownReachable : true
     boolean isReachable = checkDeviceReachable(settings.thermostat)
 
     // Only send update if reachability status changed
