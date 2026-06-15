@@ -24,7 +24,7 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.2"
+@Field static final String  APP_VERSION = "1.0.3"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -98,6 +98,13 @@ def mainPage() {
             input "createResetDevice", "bool", title: "Create Reset Button",
                  description: "Creates a button device to reset filter tracking",
                  defaultValue: false, submitOnChange: true
+        }
+
+        section("Update Notifications") {
+            input "updateNotifyDevices", "capability.notification",
+                 title: "Notify these devices when an app update is available",
+                 description: "e.g. Hubitat mobile app, Pushover, SMS",
+                 multiple: true, required: false
         }
 
         section("Devices") {
@@ -1280,9 +1287,17 @@ def checkForUpdate() {
                     state.updateAvailable = true
                     state.latestVersion = latestVersion
                     log.info "🆕 Update available: ${APP_VERSION} → ${latestVersion}"
+                    // Push once per new version so the daily check doesn't
+                    // re-notify for a version the user has already been told about.
+                    if (state.notifiedVersion != latestVersion) {
+                        sendUpdateNotification(latestVersion)
+                        state.notifiedVersion = latestVersion
+                    }
                 } else {
                     state.updateAvailable = false
                     state.latestVersion = APP_VERSION
+                    // Clear so a future update re-arms the notification.
+                    state.notifiedVersion = null
                     logDebug "✅ App is up to date (${APP_VERSION})"
                 }
             }
@@ -1290,6 +1305,29 @@ def checkForUpdate() {
     } catch (Exception e) {
         logDebug "Could not check for updates: ${e.message}"
         // Don't clear update state on failure - keep previous result
+    }
+}
+
+/**
+ * Push a "new version available" notification through the user-selected
+ * notification device(s) (Hubitat mobile app, Pushover, SMS, etc.).
+ * No-op when the user hasn't picked any notification devices.
+ */
+private void sendUpdateNotification(String latestVersion) {
+    def devices = settings.updateNotifyDevices
+    if (!devices) {
+        logDebug "No update-notification devices configured; skipping push"
+        return
+    }
+
+    String msg = "SmartFilterPro: version ${latestVersion} is available (you have ${APP_VERSION}). Update via Hubitat Package Manager."
+    devices.each { d ->
+        try {
+            d.deviceNotification(msg)
+            log.info "🔔 Sent update notification to ${d.displayName}"
+        } catch (Exception e) {
+            log.warn "Could not send update notification to ${d?.displayName}: ${e.message}"
+        }
     }
 }
 
