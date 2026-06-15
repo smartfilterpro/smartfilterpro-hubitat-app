@@ -24,7 +24,7 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.4"
+@Field static final String  APP_VERSION = "1.0.5"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -542,6 +542,12 @@ def initialize() {
     } else {
         deleteResetDevice()
     }
+
+    // Reconcile child device labels to the current HVAC name. Devices
+    // may have been created while state.sfpHvacName still held a login
+    // placeholder, or the reset button may have been added after the
+    // name was learned — this keeps both labels in sync on every save.
+    updateChildDeviceLabels()
 
     unschedule()
     runEvery30Minutes("heartbeat")
@@ -1342,8 +1348,11 @@ def pollBubbleStatus() {
         if (body.deviceName && body.deviceName != state.sfpHvacName) {
             log.info "📝 HVAC name updated: '${state.sfpHvacName}' → '${body.deviceName}'"
             state.sfpHvacName = body.deviceName
-            updateChildDeviceLabels()
         }
+        // Reconcile child device labels every poll. setLabel is guarded
+        // to a no-op when already correct, so this self-heals any label
+        // (e.g. the reset button) that drifted from the current name.
+        updateChildDeviceLabels()
 
         if (enableDebugLogging) {
             log.debug "✅ Bubble status: filterHealth=${body.filterHealth}%, minutesActive=${body.minutesActive}"

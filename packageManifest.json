@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-06-15",
-  "releaseNotes": "Fix token refresh on 401: also refresh the core JWT when a 401 arrives without throwing (soft 401), detect 401s by status code and body text, and refresh the Bubble access_token via the stored refresh_token so an expired token self-heals instead of going silent. Plus: optional update push notifications and duplicate-event fix.",
+  "releaseNotes": "Fix reset button label not tracking the HVAC name: reconcile both child device labels on every save and status poll so the reset button stays in sync with the status device. Plus: 401/token-refresh fixes, optional update push notifications, and duplicate-event fix.",
   "communityLink": "",
   "apps": [
     {
