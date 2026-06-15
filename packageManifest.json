@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-06-15",
-  "releaseNotes": "Maintenance release validating the in-app update notification path alongside backend authentication reliability improvements. No functional app changes since 1.0.5.",
+  "releaseNotes": "Fix intermittent blank status: detect Bubble responses that return HTTP 200 while wrapping an error (e.g. nested 401) or an empty payload, so an error no longer overwrites the last good status tile; refresh the token and retry once on a wrapped 401. Add an optional 'Use Test Environment' toggle to route cloud calls to the version-test database (defaults to live).",
   "communityLink": "",
   "apps": [
     {

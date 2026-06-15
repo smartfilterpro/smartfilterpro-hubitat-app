@@ -18,13 +18,15 @@ import groovy.transform.Field
 /* ============================== CONSTANTS ============================== */
 
 @Field static final String CORE_INGEST_URL = "https://core.smartfilterpro.com/ingest/v1/events:batch"
-@Field static final String BUBBLE_LOGIN_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_password"
-@Field static final String BUBBLE_REFRESH_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_refresh_token"
-@Field static final String BUBBLE_CORE_JWT_URL = "https://smartfilterpro.com/api/1.1/wf/issue_core_token_hub"
-@Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
-@Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.6"
+// Bubble has separate live and development ("version-test") databases.
+// The "Use Test Environment" option routes all Bubble calls to the
+// version-test workflows. Defaults to live so a production install never
+// talks to the dev database.
+@Field static final String BUBBLE_BASE_LIVE = "https://smartfilterpro.com/api/1.1/wf"
+@Field static final String BUBBLE_BASE_TEST = "https://smartfilterpro.com/version-test/api/1.1/wf"
+
+@Field static final String  APP_VERSION = "1.0.7"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -89,6 +91,10 @@ def mainPage() {
         }
 
         section("Options") {
+            input "useTestEnvironment", "bool",
+                 title: "Use Test Environment (version-test)",
+                 description: "Routes all SmartFilterPro cloud calls to the Bubble development database. Leave OFF for normal use.",
+                 defaultValue: false, submitOnChange: true
             input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true
             input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
                  defaultValue: DEFAULT_HTTP_TIMEOUT, range: "5..120"
@@ -414,7 +420,7 @@ def cloudLogin() {
 
         Map loginResp
         httpPost([
-            uri: BUBBLE_LOGIN_URL,
+            uri: bubbleUrl("hubitat_password"),
             contentType: "application/json",
             body: [ email: email, password: pwd ],
             timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
@@ -475,6 +481,16 @@ private def _html(String msg) {
 
 private Map _bubbleBody(Map resp) {
     return (resp?.response ?: resp) as Map
+}
+
+/**
+ * Build a Bubble workflow URL for the current environment. When the
+ * "Use Test Environment" option is on, routes to the version-test
+ * (development) database; otherwise to live.
+ */
+private String bubbleUrl(String workflow) {
+    String base = settings?.useTestEnvironment ? BUBBLE_BASE_TEST : BUBBLE_BASE_LIVE
+    return "${base}/${workflow}"
 }
 
 /* ============================== LIFECYCLE ============================== */
@@ -1227,7 +1243,7 @@ private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
 
         Map respMap
         httpPost([
-            uri: BUBBLE_CORE_JWT_URL,
+            uri: bubbleUrl("issue_core_token_hub"),
             contentType: "application/json",
             requestContentType: "application/json",
             headers: [ Authorization: "Bearer ${at}" ],
@@ -1290,7 +1306,7 @@ private boolean _refreshBubbleAccessToken() {
 
         Map respMap
         httpPost([
-            uri: BUBBLE_REFRESH_URL,
+            uri: bubbleUrl("hubitat_refresh_token"),
             contentType: "application/json",
             requestContentType: "application/json",
             body: [ user_id: state.sfpUserId, refresh_token: rt ],
@@ -1322,7 +1338,7 @@ private boolean _refreshBubbleAccessToken() {
 
 /* ============================== BUBBLE STATUS POLLING ============================== */
 
-def pollBubbleStatus() {
+def pollBubbleStatus(boolean isRetry = false) {
     if (!state.sfpAccessToken || !state.sfpHvacId) {
         if (enableDebugLogging) log.debug "⏭️ Skipping status poll (not linked)"
         return
@@ -1333,7 +1349,7 @@ def pollBubbleStatus() {
 
         Map respMap
         httpPost([
-            uri: BUBBLE_STATUS_URL,
+            uri: bubbleUrl("hubitat_therm_status"),
             contentType: "application/json",
             requestContentType: "application/json",
             headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
@@ -1342,6 +1358,32 @@ def pollBubbleStatus() {
         ]) { resp -> respMap = resp.data }
 
         Map body = _bubbleBody(respMap)
+
+        // Bubble returns HTTP 200 even on failure, wrapping the real error
+        // inside the body, e.g.
+        //   { status:"success", response:{ Body:"...invalid_token...", status:401 } }
+        // and an unresolved request can also come back as an empty
+        // response:{}. Detect both so we never overwrite a good tile with
+        // nulls — the cause of the intermittent "blank status".
+        Integer innerStatus = (body?.status instanceof Number) ? (body.status as Integer) : null
+        String innerBody = (body?.Body ?: "").toString().toLowerCase()
+        boolean hasPayload = (body?.filterHealth != null) || (body?.deviceName != null)
+        boolean looksLikeError = (innerStatus != null && innerStatus >= 400) ||
+                                 innerBody.contains("invalid_token") ||
+                                 innerBody.contains("\"error\"")
+
+        if (looksLikeError || !hasPayload) {
+            log.warn "⚠️ Status poll returned no valid payload (innerStatus=${innerStatus}); keeping last known status. Detail: ${body?.Body ?: body}"
+            // A wrapped 401 means an expired access_token OR an hvac_id not
+            // tied to it. Refresh once and retry; if the id is the problem
+            // this still fails and we simply keep the previous good status.
+            if (!isRetry && innerStatus == 401 && _refreshBubbleAccessToken()) {
+                pollBubbleStatus(true)
+            }
+            return
+        }
+
+        // Valid payload from here on.
         state.sfpLastStatus = body
 
         // Update HVAC name if it changed in Bubble
@@ -2033,7 +2075,7 @@ def resetNow() {
 
         Map respMap
         httpPost([
-            uri: BUBBLE_RESET_URL,
+            uri: bubbleUrl("hubitat_reset_filter"),
             contentType: "application/json",
             requestContentType: "application/json",
             headers: [ Authorization: "Bearer ${state.sfpAccessToken}" ],
