@@ -493,6 +493,25 @@ private String bubbleUrl(String workflow) {
     return "${base}/${workflow}"
 }
 
+/**
+ * Inspect an unwrapped Bubble body for a wrapped error. Bubble returns
+ * HTTP 200 even on failure, nesting the real status in the body, e.g.
+ *   { Body:"...invalid_token...", status:401 }.
+ * Returns [ error: boolean, authError: boolean, status: Integer ].
+ */
+private Map _bubbleResult(Map body) {
+    Integer innerStatus = (body?.status instanceof Number) ? (body.status as Integer) : null
+    String innerBody = (body?.Body ?: "").toString().toLowerCase()
+    boolean authError = (innerStatus == 401) ||
+                        innerBody.contains("invalid_token") ||
+                        innerBody.contains("expired") ||
+                        innerBody.contains("unauthorized")
+    boolean isError = authError ||
+                      (innerStatus != null && innerStatus >= 400) ||
+                      innerBody.contains("\"error\"")
+    return [ error: isError, authError: authError, status: innerStatus ]
+}
+
 /* ============================== LIFECYCLE ============================== */
 
 def installed() {
@@ -1365,23 +1384,15 @@ def pollBubbleStatus(boolean isRetry = false) {
         // and an unresolved request can also come back as an empty
         // response:{}. Detect both so we never overwrite a good tile with
         // nulls — the cause of the intermittent "blank status".
-        Integer innerStatus = (body?.status instanceof Number) ? (body.status as Integer) : null
-        String innerBody = (body?.Body ?: "").toString().toLowerCase()
+        Map result = _bubbleResult(body)
         boolean hasPayload = (body?.filterHealth != null) || (body?.deviceName != null)
-        boolean authError = (innerStatus == 401) ||
-                            innerBody.contains("invalid_token") ||
-                            innerBody.contains("expired") ||
-                            innerBody.contains("unauthorized")
-        boolean looksLikeError = authError ||
-                                 (innerStatus != null && innerStatus >= 400) ||
-                                 innerBody.contains("\"error\"")
 
-        if (looksLikeError || !hasPayload) {
-            log.warn "⚠️ Status poll returned no valid payload (innerStatus=${innerStatus}); keeping last known status. Detail: ${body?.Body ?: body}"
+        if (result.error || !hasPayload) {
+            log.warn "⚠️ Status poll returned no valid payload (innerStatus=${result.status}); keeping last known status. Detail: ${body?.Body ?: body}"
             // A wrapped auth error means an expired access_token OR an
             // hvac_id not tied to it. Refresh once and retry; if the id is
             // the problem this still fails and we keep the previous status.
-            if (!isRetry && authError && _refreshBubbleAccessToken()) {
+            if (!isRetry && result.authError && _refreshBubbleAccessToken()) {
                 pollBubbleStatus(true)
             }
             return
@@ -2068,7 +2079,7 @@ private boolean _isHttpClientError(String errMsg) {
 
 /* ============================== FILTER RESET ============================== */
 
-def resetNow() {
+def resetNow(boolean isRetry = false) {
     if (!state.sfpAccessToken || !state.sfpHvacId) {
         log.warn "❌ Cannot reset filter - not linked to SmartFilterPro"
         return false
@@ -2088,6 +2099,19 @@ def resetNow() {
         ]) { resp -> respMap = resp.data }
 
         Map body = _bubbleBody(respMap)
+
+        // Bubble returns HTTP 200 even on failure, wrapping the real error
+        // in the body — don't report success on a wrapped auth/error.
+        Map result = _bubbleResult(body)
+        if (result.error) {
+            log.warn "⚠️ Filter reset failed (innerStatus=${result.status}): ${body?.Body ?: body}"
+            // On a wrapped auth error, refresh the token and retry once.
+            if (!isRetry && result.authError && _refreshBubbleAccessToken()) {
+                return resetNow(true)
+            }
+            return false
+        }
+
         log.info "✅ Filter reset successful: ${body}"
 
         // Refresh status after reset
