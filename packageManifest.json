@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-06-15",
-  "releaseNotes": "Add optional push notifications (via any Hubitat notification device) when a new app version is available. Plus: fix duplicate events by deferring sequence number reservation until after the deduplication check passes.",
+  "releaseNotes": "Fix token refresh on 401: also refresh the core JWT when a 401 arrives without throwing (soft 401), detect 401s by status code and body text, and refresh the Bubble access_token via the stored refresh_token so an expired token self-heals instead of going silent. Plus: optional update push notifications and duplicate-event fix.",
   "communityLink": "",
   "apps": [
     {

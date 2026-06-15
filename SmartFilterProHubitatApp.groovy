@@ -24,7 +24,7 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.3"
+@Field static final String  APP_VERSION = "1.0.4"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -1140,14 +1140,39 @@ private Map _doCorePost(List batch, boolean isRetry) {
             if (isRetry) log.info "✅ RETRY SUCCESSFUL!"
             return [kind: "ok", status: status, data: respData]
         }
-        // Non-2xx that somehow didn't throw. Treat as transient so
+        // Some Core 401s arrive HERE — delivered to the success closure
+        // instead of being thrown ("soft 401"). Without this branch an
+        // expired JWT falls through to "transient" and gets retried via
+        // the outbox forever with the same dead token, never refreshing.
+        // Mirror the catch-block refresh path, keyed on the status code.
+        if (status == 401 && !isRetry) {
+            log.warn "⚠️ Core 401 (no throw) — refreshing token and retrying"
+            if (_issueCoreTokenOrLog()) {
+                return _doCorePost(batch, true)
+            }
+            return [kind: "permanent", reason: "401_refresh_failed", error: "status=401"]
+        }
+        // Other non-2xx that somehow didn't throw. Treat as transient so
         // the outbox retries — if it's actually a permanent client
         // error, the next attempt will throw and reclassify.
         log.warn "⚠️ Core returned non-2xx without throwing: ${status}"
         return [kind: "transient", reason: "non_2xx_${status}", error: "status=${status}"]
     } catch (Exception e) {
         String errMsg = e.toString()
-        boolean is401 = errMsg.contains("401") || errMsg.toLowerCase().contains("unauthorized")
+        // Prefer the real HTTP status when the exception exposes it
+        // (Hubitat's HttpResponseException does), then fall back to
+        // matching the message/body — some 401s surface only the body
+        // text ("invalid_token" / "Access token expired") with no code.
+        Integer exStatus = null
+        try {
+            if (e.respondsTo("getStatusCode")) exStatus = e.getStatusCode() as Integer
+        } catch (ignored) { /* sandbox / no such method */ }
+        String lower = errMsg.toLowerCase()
+        boolean is401 = (exStatus == 401) ||
+                        errMsg.contains("401") ||
+                        lower.contains("unauthorized") ||
+                        lower.contains("invalid_token") ||
+                        lower.contains("access token expired")
         boolean is4xx = _isHttpClientError(errMsg)
 
         if (is401 && !isRetry) {
@@ -1184,7 +1209,7 @@ private boolean _ensureCoreTokenValid() {
     return _issueCoreTokenOrLog()
 }
 
-private boolean _issueCoreTokenOrLog() {
+private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
     String at = (state.sfpAccessToken ?: "")
     if (!at) {
         log.warn "❌ Cannot issue core token — no Bubble access_token"
@@ -1193,7 +1218,7 @@ private boolean _issueCoreTokenOrLog() {
 
     try {
         log.info "🔄 Requesting new core_token from Bubble..."
-        
+
         Map respMap
         httpPost([
             uri: BUBBLE_CORE_JWT_URL,
@@ -1203,12 +1228,12 @@ private boolean _issueCoreTokenOrLog() {
             body: [ user_id: state.sfpUserId ],
             timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
         ]) { resp -> respMap = resp.data }
-        
+
         Map body = _bubbleBody(respMap)
-        
+
         String core = (body?.core_token ?: body?.token ?: "").toString()
         Long exp = (body?.core_token_exp ?: body?.exp ?: body?.expires_at) as Long
-        
+
         if (core) {
             state.sfpCoreToken = core
             state.sfpCoreTokenExp = exp
@@ -1219,7 +1244,72 @@ private boolean _issueCoreTokenOrLog() {
             return false
         }
     } catch (Exception e) {
+        String msg = e.toString()
+        String lower = msg.toLowerCase()
+        boolean authFail = msg.contains("401") || lower.contains("unauthorized") ||
+                           lower.contains("invalid_token") || lower.contains("access token expired")
+        // Bubble rejected our access_token itself. Try the stored
+        // refresh_token once, then re-issue. Without this an expired
+        // access_token never self-heals — it's not refreshed anywhere
+        // else — and the device goes silent until a manual re-link.
+        if (authFail && !isRetry && _refreshBubbleAccessToken()) {
+            return _issueCoreTokenOrLog(true)
+        }
         log.error "❌ Failed to issue core token: ${e.message}"
+        return false
+    }
+}
+
+/**
+ * Exchange the stored refresh_token for a fresh access_token (and, if
+ * Bubble returns them, a rotated refresh_token / core_token). Called
+ * when Bubble rejects the current access_token as expired/invalid.
+ * Returns true only if a new access_token was obtained.
+ *
+ * Assumes the hubitat_refresh_token workflow accepts
+ * { user_id, refresh_token } and returns at least an access_token.
+ * Parsing is defensive about field names to tolerate minor contract
+ * differences; a mismatch just logs and returns false (no worse than
+ * the prior silent-failure behaviour).
+ */
+private boolean _refreshBubbleAccessToken() {
+    String rt = (state.sfpRefreshToken ?: "")
+    if (!rt) {
+        log.warn "❌ Cannot refresh — no Bubble refresh_token stored (re-link required)"
+        return false
+    }
+
+    try {
+        log.info "🔄 Refreshing Bubble access_token via refresh_token..."
+
+        Map respMap
+        httpPost([
+            uri: BUBBLE_REFRESH_URL,
+            contentType: "application/json",
+            requestContentType: "application/json",
+            body: [ user_id: state.sfpUserId, refresh_token: rt ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> respMap = resp.data }
+
+        Map body = _bubbleBody(respMap)
+        String newAccess = (body?.access_token ?: body?.token ?: "").toString()
+        if (!newAccess) {
+            log.error "❌ Refresh response missing access_token: ${body}"
+            return false
+        }
+
+        state.sfpAccessToken = newAccess
+        // Bubble may rotate the refresh token; keep the newest if present.
+        if (body?.refresh_token) state.sfpRefreshToken = body.refresh_token
+        // Some refresh flows also hand back a fresh core_token.
+        if (body?.core_token) {
+            state.sfpCoreToken = body.core_token
+            if (body?.expires_at) state.sfpCoreTokenExp = body.expires_at as Long
+        }
+        log.info "✅ Bubble access_token refreshed"
+        return true
+    } catch (Exception e) {
+        log.error "❌ Failed to refresh Bubble access_token: ${e.message} (re-link may be required)"
         return false
     }
 }
