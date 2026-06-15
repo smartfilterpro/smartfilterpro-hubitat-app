@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-06-15",
-  "releaseNotes": "Fix duplicate events by deferring sequence number reservation until after deduplication check passes. Eliminates >24h daily runtime totals caused by duplicate event posting.",
+  "releaseNotes": "Add optional push notifications (via any Hubitat notification device) when a new app version is available. Plus: fix duplicate events by deferring sequence number reservation until after the deduplication check passes.",
   "communityLink": "",
   "apps": [
     {
