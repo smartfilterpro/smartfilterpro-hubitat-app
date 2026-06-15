@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-06-15",
-  "releaseNotes": "Fix reset button label not tracking the HVAC name: reconcile both child device labels on every save and status poll so the reset button stays in sync with the status device. Plus: 401/token-refresh fixes, optional update push notifications, and duplicate-event fix.",
+  "releaseNotes": "Maintenance release validating the in-app update notification path alongside backend authentication reliability improvements. No functional app changes since 1.0.5.",
   "communityLink": "",
   "apps": [
     {
