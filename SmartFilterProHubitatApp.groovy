@@ -1368,16 +1368,20 @@ def pollBubbleStatus(boolean isRetry = false) {
         Integer innerStatus = (body?.status instanceof Number) ? (body.status as Integer) : null
         String innerBody = (body?.Body ?: "").toString().toLowerCase()
         boolean hasPayload = (body?.filterHealth != null) || (body?.deviceName != null)
-        boolean looksLikeError = (innerStatus != null && innerStatus >= 400) ||
-                                 innerBody.contains("invalid_token") ||
+        boolean authError = (innerStatus == 401) ||
+                            innerBody.contains("invalid_token") ||
+                            innerBody.contains("expired") ||
+                            innerBody.contains("unauthorized")
+        boolean looksLikeError = authError ||
+                                 (innerStatus != null && innerStatus >= 400) ||
                                  innerBody.contains("\"error\"")
 
         if (looksLikeError || !hasPayload) {
             log.warn "⚠️ Status poll returned no valid payload (innerStatus=${innerStatus}); keeping last known status. Detail: ${body?.Body ?: body}"
-            // A wrapped 401 means an expired access_token OR an hvac_id not
-            // tied to it. Refresh once and retry; if the id is the problem
-            // this still fails and we simply keep the previous good status.
-            if (!isRetry && innerStatus == 401 && _refreshBubbleAccessToken()) {
+            // A wrapped auth error means an expired access_token OR an
+            // hvac_id not tied to it. Refresh once and retry; if the id is
+            // the problem this still fails and we keep the previous status.
+            if (!isRetry && authError && _refreshBubbleAccessToken()) {
                 pollBubbleStatus(true)
             }
             return
