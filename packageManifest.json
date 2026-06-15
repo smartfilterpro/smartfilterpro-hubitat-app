@@ -1,10 +1,10 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-04-11",
-  "releaseNotes": "Deduplicate Mode_Change events caused by overlapping thermostat attribute subscriptions firing within milliseconds of each other on a single state transition.",
+  "dateReleased": "2026-06-15",
+  "releaseNotes": "Fix duplicate events by deferring sequence number reservation until after deduplication check passes. Eliminates >24h daily runtime totals caused by duplicate event posting.",
   "communityLink": "",
   "apps": [
     {

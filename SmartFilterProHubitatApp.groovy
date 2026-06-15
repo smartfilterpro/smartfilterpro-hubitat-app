@@ -24,7 +24,7 @@ import groovy.transform.Field
 @Field static final String BUBBLE_STATUS_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_therm_status"
 @Field static final String BUBBLE_RESET_URL = "https://smartfilterpro.com/api/1.1/wf/hubitat_reset_filter"
 
-@Field static final String  APP_VERSION = "1.0.1"
+@Field static final String  APP_VERSION = "1.0.2"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -995,7 +995,9 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
         equipment_status: finalEquipStatus,  // Use 8-state value
         is_active: finalIsActive,
         runtime_seconds: runtimeSeconds,
-        sequence_number: reserveSequenceNumber(state.sfpHvacId),
+        // sequence_number is reserved in _postToCoreWithJwt, AFTER the
+        // dedup check (_claimModeChangeSlot) has passed, so duplicate
+        // events that get blocked never consume a sequence number.
         timestamp: ts,
         recorded_at: ts,
         observed_at: ts,
@@ -1030,6 +1032,18 @@ private boolean _postToCoreWithJwt(Object body) {
     }
 
     List batch = (body instanceof List) ? (body as List) : [body]
+
+    // Reserve sequence numbers ONLY for events we're actually posting.
+    // By this point the dedup check (_claimModeChangeSlot) in handleEvent
+    // has already passed, so blocked duplicate events never consume a
+    // sequence number. Reserved here (before buffering) because both the
+    // event buffer and Core dedup key on sequence_number.
+    batch.each { evt ->
+        Map event = evt as Map
+        if (!event.sequence_number) {
+            event.sequence_number = reserveSequenceNumber((event.device_id ?: state.sfpHvacId) as String)
+        }
+    }
 
     // Buffer events on the fresh path only. Outbox drain retries
     // call _doCorePost directly and skip buffering, so this is the
