@@ -1280,10 +1280,21 @@ private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
             state.sfpCoreTokenExp = exp
             log.info "✅ Core token refreshed (exp: ${exp})"
             return true
-        } else {
-            log.error "❌ Core token response missing token: ${body}"
-            return false
         }
+
+        // Soft 401: Bubble rejected our access_token in the response body
+        // (status:401 / invalid_token) rather than throwing, so the catch
+        // block below never runs. Mirror its self-heal path here — refresh
+        // the access_token once and re-issue. Without this an expired
+        // access_token never recovers and events are dropped until a manual
+        // re-link, even though the refresh_token is sitting right there.
+        Map authCheck = _bubbleResult(body)
+        if (authCheck.authError && !isRetry && _refreshBubbleAccessToken()) {
+            return _issueCoreTokenOrLog(true)
+        }
+
+        log.error "❌ Core token response missing token: ${body}"
+        return false
     } catch (Exception e) {
         String msg = e.toString()
         String lower = msg.toLowerCase()
