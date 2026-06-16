@@ -43,7 +43,11 @@ def updateStatus(Map status) {
     }
 
     if (status.minutesActive != null) {
-        def hours = (status.minutesActive / 60).round(2)
+        // BigDecimal has no round(int) — only round(MathContext) — so a
+        // fractional minutesActive (e.g. 2714.55) made .round(2) throw and
+        // abort the whole updateStatus, dropping every event. setScale with
+        // an explicit RoundingMode is the correct BigDecimal API.
+        def hours = (status.minutesActive as BigDecimal).divide(60g, 2, java.math.RoundingMode.HALF_UP)
         log.debug "Setting minutesActive: ${status.minutesActive}, hoursActive: ${hours}"
         sendEvent(name: "minutesActive", value: status.minutesActive, unit: "min")
         sendEvent(name: "hoursActive", value: hours, unit: "hr")
