@@ -39,6 +39,14 @@ import groovy.transform.Field
 // posted Mode_Change within this window.
 @Field static final Long MODE_CHANGE_DEDUP_WINDOW_MS = 3000L
 
+// Throttle window for Telemetry_Update events. A single environmental
+// tick (e.g. temperature + humidity arriving together) fires multiple
+// attribute events, each of which would otherwise post a Telemetry_Update
+// and burn a sequence number. At most one Telemetry_Update is posted per
+// device per window; Mode_Change and CONNECTIVITY_CHANGE are never
+// throttled.
+@Field static final Long TELEMETRY_MIN_INTERVAL_MS = 60000L
+
 /* ============================== METADATA ============================== */
 
 definition(
@@ -433,7 +441,7 @@ def cloudLogin() {
         state.sfpRefreshToken = body.refresh_token
         state.sfpUserId       = body.user_id
         state.sfpCoreToken    = body.core_token
-        state.sfpCoreTokenExp = body.expires_at
+        state.sfpCoreTokenExp = _normalizeEpochSeconds(body.expires_at)
 
         // HVAC map - handle both single and multiple thermostats
         Map choices = [:]
@@ -728,6 +736,41 @@ private boolean _claimModeChangeSlot(String equipmentStatus) {
     return true
 }
 
+/**
+ * Claim a Telemetry_Update post slot for the configured thermostat.
+ *
+ * Returns true if the caller should proceed with posting, false if a
+ * Telemetry_Update was already posted for this device within
+ * TELEMETRY_MIN_INTERVAL_MS. Only the Telemetry_Update path consults
+ * this — Mode_Change and CONNECTIVITY_CHANGE are never throttled.
+ *
+ * Uses atomicState so concurrent handlers (temperature and humidity
+ * events firing within milliseconds of each other) see each other's
+ * writes immediately and cannot both pass the throttle check. Same
+ * pattern as _claimModeChangeSlot.
+ */
+private boolean _claimTelemetrySlot() {
+    String uid = state.sfpUserId
+    String devId = settings.thermostat?.getId()?.toString()
+    if (!uid || !devId) return true   // Can't throttle without keys; fail open
+
+    String keyLastTime = "lastTelemetryPostTime_${uid}-${devId}"
+
+    Long lastTime = (atomicState[keyLastTime] as Long) ?: 0L
+    Long nowMs    = now()
+
+    if ((nowMs - lastTime) < TELEMETRY_MIN_INTERVAL_MS) {
+        if (enableDebugLogging) {
+            log.debug "⏭️ Throttle: skipping Telemetry_Update — last posted ${nowMs - lastTime}ms ago"
+        }
+        return false
+    }
+
+    // Claim the slot BEFORE posting so a concurrent handler sees it.
+    atomicState[keyLastTime] = nowMs
+    return true
+}
+
 def handleEvent(evt) {
     if (enableDebugLogging)
         log.debug "🔔 Event received: ${evt.name} = ${evt.value} from ${evt.displayName}"
@@ -811,6 +854,13 @@ def handleEvent(evt) {
         Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive, isReachable)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
+
+        // Throttle the POST (not the local bookkeeping above): a single
+        // environmental tick fires temperature and humidity events back to
+        // back, each of which would burn a sequence number.
+        if (!_claimTelemetrySlot()) {
+            return
+        }
 
         _postToCoreWithJwt(payload)
         return
@@ -993,8 +1043,8 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     String ts = new Date().toInstant().toString()
 
     // Use 8-state equipment status
-	String finalEquipStatus = equipmentStatus ?: eventType ?: "Idle"  // Changed from "Fan_off"
-	Boolean finalIsActive = (overrideIsActive != null) ? overrideIsActive : (eventType != "Idle")  // Changed from "Fan_off"
+	String finalEquipStatus = equipmentStatus ?: "Idle"
+	Boolean finalIsActive = (overrideIsActive != null) ? overrideIsActive : (finalEquipStatus != "Idle")
 
     // Map 8-state system to boolean flags
     boolean isCooling = (finalEquipStatus == "Cooling_Fan" || finalEquipStatus == "Cooling")
@@ -1234,6 +1284,23 @@ private Map _doCorePost(List batch, boolean isRetry) {
     }
 }
 
+/**
+ * Normalize an epoch timestamp to SECONDS.
+ *
+ * Bubble may return expires_at in either seconds or milliseconds.
+ * _ensureCoreTokenValid compares state.sfpCoreTokenExp against
+ * now()/1000 (seconds), so a milliseconds value would make the token
+ * look valid for centuries and silently disable proactive refresh
+ * (the app would only ever refresh reactively via 401s). Anything
+ * above 10,000,000,000 (~year 2286 as seconds) can only be
+ * milliseconds, so divide it down.
+ */
+private Long _normalizeEpochSeconds(val) {
+    if (val == null) return null
+    Long l = val as Long
+    return (l > 10000000000L) ? ((l / 1000L) as Long) : l
+}
+
 private boolean _ensureCoreTokenValid() {
     Long exp = (state.sfpCoreTokenExp as Long)
     Long nowSec = (now() / 1000L) as Long
@@ -1273,7 +1340,7 @@ private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
         Map body = _bubbleBody(respMap)
 
         String core = (body?.core_token ?: body?.token ?: "").toString()
-        Long exp = (body?.core_token_exp ?: body?.exp ?: body?.expires_at) as Long
+        Long exp = _normalizeEpochSeconds(body?.core_token_exp ?: body?.exp ?: body?.expires_at)
 
         if (core) {
             state.sfpCoreToken = core
@@ -1356,7 +1423,7 @@ private boolean _refreshBubbleAccessToken() {
         // Some refresh flows also hand back a fresh core_token.
         if (body?.core_token) {
             state.sfpCoreToken = body.core_token
-            if (body?.expires_at) state.sfpCoreTokenExp = body.expires_at as Long
+            if (body?.expires_at) state.sfpCoreTokenExp = _normalizeEpochSeconds(body.expires_at)
         }
         log.info "✅ Bubble access_token refreshed"
         return true
@@ -1854,41 +1921,49 @@ private void handleGapResponse(List gaps) {
 }
 
 /**
- * Resend buffered events to Core (for gap backfill)
+ * Resend buffered events to Core (for gap backfill).
+ *
+ * Posts through _doCorePost — the same worker _postToCoreWithJwt and
+ * drainOutbox use — so this path inherits the 401 token-refresh
+ * handling, and enqueues to the outbox on transient failure so a
+ * flaky network can't silently lose the one batch that exists
+ * specifically to recover lost data.
+ *
+ * The whole gap is sent as a single batch, exactly as before. The
+ * events are NOT re-buffered or re-sequenced here: they came out of
+ * state.eventBuffer and already carry their sequence numbers, and
+ * drainOutbox retries deliberately skip addToEventBuffer too.
+ *
+ * Caveat: when this runs from inside drainOutbox (gap reported on a
+ * retried batch), a transient enqueue here can be overwritten by
+ * drain's final atomicState.outbox write — the same non-atomic
+ * read-modify-write window documented on enqueueOutbox. The events
+ * stay in state.eventBuffer, so Core re-reports the gap on the next
+ * successful post and recovery re-triggers.
  */
 private void resendBufferedEvents(List events) {
     if (events == null || events.isEmpty()) {
         return
     }
 
-    String token = state.sfpCoreToken
-    if (!token) {
-        log.error "Cannot resend events: no Core token"
+    log.info "🔄 Resending ${events.size()} buffered event(s) to fill gap"
+
+    Map result = _doCorePost(events, false)
+
+    if (result.kind == "ok") {
+        log.info "✅ Successfully backfilled ${events.size()} event(s)"
         return
     }
 
-    log.info "🔄 Resending ${events.size()} buffered event(s) to fill gap"
-
-    Map params = [
-        uri: CORE_INGEST_URL,
-        contentType: "application/json",
-        requestContentType: "application/json",
-        headers: [ Authorization: "Bearer ${token}" ],
-        body: events,
-        timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
-    ]
-
-    try {
-        httpPostJson(params) { resp ->
-            if (resp.status >= 200 && resp.status < 300) {
-                log.info "✅ Successfully backfilled ${events.size()} event(s)"
-            } else {
-                log.error "❌ Backfill failed (${resp.status})"
-            }
-        }
-    } catch (Exception e) {
-        log.error "❌ Backfill error: ${e.message}"
+    if (result.kind == "permanent") {
+        log.error "❌ Backfill permanent error (${result.reason}) — dropping ${events.size()} event(s): ${result.error}"
+        bumpOutboxDroppedCount()
+        return
     }
+
+    // Transient: enqueue for retry via the outbox.
+    log.warn "⚠️ Backfill transient error (${result.reason}) — enqueueing ${events.size()} event(s) to outbox"
+    enqueueOutbox(events, (result.reason as String) ?: "transient")
 }
 
 /* ============================== OUTBOX (RELIABLE DELIVERY) ============================== */
