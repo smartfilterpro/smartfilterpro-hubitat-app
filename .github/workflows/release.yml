@@ -1,0 +1,69 @@
+# Release on merge to main.
+#
+# Hubitat Package Manager reads packageManifest.json from main, and each
+# code "location" in it is pinned to the tag v<version>. So a merge to main
+# only reaches users once that tag exists — and this workflow creates it:
+#
+#   - manifest, app and drivers agree on <version> (check_manifest.py), and
+#   - no release v<version> exists yet
+#       → create the tag at this commit and publish the GitHub Release
+#         with the manifest's releaseNotes. HPM users see the update on
+#         their next check.
+#   - release v<version> already exists
+#       → the code or manifest on main must be identical to the tag. If it
+#         isn't, someone merged a change without bumping the version; HPM
+#         would never deliver it, so fail loudly instead of staying silent.
+#
+# How to release: bump "version" in packageManifest.json, APP_VERSION in the
+# app and DRIVER_VERSION in both drivers to the same X.Y.Z, point every
+# "location" at v<X.Y.Z>, update dateReleased and releaseNotes, merge dev
+# into main. That's it.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: consistency checks
+        run: python scripts/check_manifest.py
+
+      - name: read version
+        id: v
+        run: |
+          echo "version=$(python -c "import json;print(json.load(open('packageManifest.json'))['version'])")" >> "$GITHUB_OUTPUT"
+
+      - name: tag and publish, or verify the existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          tag="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists"
+            if git diff --quiet "$tag" HEAD -- '*.groovy' packageManifest.json; then
+              echo "main matches $tag — nothing to release"
+              exit 0
+            fi
+            echo "::error::main has changes to the app, drivers or manifest that are not in $tag. Bump the version (manifest, APP_VERSION, DRIVER_VERSION, locations) so Hubitat Package Manager can deliver them."
+            git diff --stat "$tag" HEAD -- '*.groovy' packageManifest.json
+            exit 1
+          fi
+          notes=$(python -c "import json;print(json.load(open('packageManifest.json'))['releaseNotes'])")
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "$notes"
+          echo "published $tag"
