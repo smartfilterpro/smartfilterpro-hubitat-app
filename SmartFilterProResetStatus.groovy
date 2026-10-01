@@ -1,5 +1,13 @@
+import groovy.transform.Field
+
+// Must equal "version" in packageManifest.json (scripts/check_manifest.py
+// enforces it). Recorded on the device as the "driverVersion" data value so
+// a hub's installed driver build can be identified.
+@Field static final String DRIVER_VERSION = "1.0.8"
+
 metadata {
-    definition(name: "SmartFilterPro Status Sensor", namespace: "smartfilterpro", author: "Eric Hanfman") {
+    definition(name: "SmartFilterPro Status Sensor", namespace: "smartfilterpro", author: "Eric Hanfman",
+               importUrl: "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProResetStatus.groovy") {
         capability "Sensor"
         capability "Refresh"
 
@@ -16,12 +24,14 @@ metadata {
 }
 
 def installed() {
-    log.info "SmartFilterPro Status Sensor installed"
+    log.info "SmartFilterPro Status Sensor installed (v${DRIVER_VERSION})"
+    updateDataValue("driverVersion", DRIVER_VERSION)
     refresh()
 }
 
 def updated() {
-    log.info "SmartFilterPro Status Sensor updated"
+    log.info "SmartFilterPro Status Sensor updated (v${DRIVER_VERSION})"
+    updateDataValue("driverVersion", DRIVER_VERSION)
 }
 
 def refresh() {

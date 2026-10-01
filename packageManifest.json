@@ -1,17 +1,20 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-06-15",
-  "releaseNotes": "Fix intermittent blank status: detect Bubble responses that return HTTP 200 while wrapping an error (e.g. nested 401) or an empty payload, so an error no longer overwrites the last good status tile or reports a false reset success; refresh the token and retry once on a wrapped auth error (status poll and filter reset). Add an optional 'Use Test Environment' toggle to route cloud calls to the version-test database (defaults to live).",
+  "dateReleased": "2026-10-01",
+  "releaseNotes": "Fix BigDecimal.round crash in the status sensor. Refresh the access token on a wrapped (soft) 401 when issuing a core_token. Fix is_active on connectivity events, gap-resend reliability, Telemetry_Update spam and token units. 'Use Test Environment' now routes Core runtime posts to the development Core as well as Bubble (previously test telemetry was rejected by production Core). Code locations are now pinned to the release tag, so an update only ships when a new version is published; a beta channel (Hubitat Package Manager > Settings > install beta versions) tracks the dev branch.",
+  "betaVersion": "1.0.8",
   "communityLink": "",
+  "gitHubUrl": "https://github.com/smartfilterpro/smartfilterpro-hubitat-app",
   "apps": [
     {
       "id": "5a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
       "name": "SmartFilterPro Thermostat Bridge (8-State)",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProHubitatApp.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.8/SmartFilterProHubitatApp.groovy",
+      "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProHubitatApp.groovy",
       "required": true,
       "oauth": false,
       "primary": true
@@ -22,14 +25,16 @@
       "id": "6b2c3d4e-5f6a-7b8c-9d0e-1f2a3b4c5d6e",
       "name": "SmartFilterPro Status Sensor",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProResetStatus.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.8/SmartFilterProResetStatus.groovy",
+      "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProResetStatus.groovy",
       "required": false
     },
     {
       "id": "7c3d4e5f-6a7b-8c9d-0e1f-2a3b4c5d6e7f",
       "name": "SmartFilterPro Reset Button",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProResetButton.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.8/SmartFilterProResetButton.groovy",
+      "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProResetButton.groovy",
       "required": false
     }
   ]

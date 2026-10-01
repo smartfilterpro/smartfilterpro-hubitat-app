@@ -17,16 +17,22 @@ import groovy.transform.Field
 
 /* ============================== CONSTANTS ============================== */
 
-@Field static final String CORE_INGEST_URL = "https://core.smartfilterpro.com/ingest/v1/events:batch"
-
-// Bubble has separate live and development ("version-test") databases.
-// The "Use Test Environment" option routes all Bubble calls to the
-// version-test workflows. Defaults to live so a production install never
-// talks to the dev database.
+// An environment is a PAIR: the Bubble app the hub logs into and the Core
+// Ingest service it posts to. They must match — Bubble mints the core_token
+// with that environment's secret, so a token from the test Bubble is
+// rejected by production Core. The "Use Test Environment" option switches
+// BOTH (it used to switch Bubble only, leaving Core on production, so test
+// telemetry was posted with a test token and rejected). Defaults to live so
+// a production install never talks to the dev environment.
 @Field static final String BUBBLE_BASE_LIVE = "https://smartfilterpro.com/api/1.1/wf"
 @Field static final String BUBBLE_BASE_TEST = "https://smartfilterpro.com/version-test/api/1.1/wf"
+@Field static final String CORE_INGEST_URL_LIVE = "https://core.smartfilterpro.com/ingest/v1/events:batch"
+@Field static final String CORE_INGEST_URL_TEST = "https://core-ingest-dev.up.railway.app/ingest/v1/events:batch"
 
-@Field static final String  APP_VERSION = "1.0.7"
+// APP_VERSION must equal "version" in packageManifest.json (and
+// DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
+// CI; the release workflow tags main as v<version> once they agree.
+@Field static final String  APP_VERSION = "1.0.8"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -55,6 +61,7 @@ definition(
     author: "Eric Hanfman",
     description: "Tracks thermostat runtime with 8-state system & posts directly to Core with JWT.",
     category: "Convenience",
+    importUrl: "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProHubitatApp.groovy",
     iconUrl: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg",
     iconX2Url: "https://51568b615cebbb736b16194a197c101f.cdn.bubble.io/f1752759064237x462020606147641540/sfp%20image.svg"
 )
@@ -101,7 +108,7 @@ def mainPage() {
         section("Options") {
             input "useTestEnvironment", "bool",
                  title: "Use Test Environment (version-test)",
-                 description: "Routes all SmartFilterPro cloud calls to the Bubble development database. Leave OFF for normal use.",
+                 description: "Routes all SmartFilterPro cloud calls (the Bubble app AND the Core runtime service) to the development environment. Leave OFF for normal use.",
                  defaultValue: false, submitOnChange: true
             input "enableDebugLogging", "bool", title: "Enable Debug Logging", defaultValue: true
             input "httpTimeout", "number", title: "HTTP Timeout (seconds)",
@@ -499,6 +506,14 @@ private Map _bubbleBody(Map resp) {
 private String bubbleUrl(String workflow) {
     String base = settings?.useTestEnvironment ? BUBBLE_BASE_TEST : BUBBLE_BASE_LIVE
     return "${base}/${workflow}"
+}
+
+/**
+ * Core Ingest URL for the current environment — the Core that accepts
+ * core_tokens minted by the Bubble bubbleUrl() points at.
+ */
+private String coreIngestUrl() {
+    return settings?.useTestEnvironment ? CORE_INGEST_URL_TEST : CORE_INGEST_URL_LIVE
 }
 
 /**
@@ -1149,7 +1164,7 @@ private boolean _postToCoreWithJwt(Object body) {
     batch.each { addToEventBuffer(it as Map) }
 
     if (enableDebugLogging) {
-        log.debug "📤 POST to Core: ${CORE_INGEST_URL}"
+        log.debug "📤 POST to Core: ${coreIngestUrl()}"
         log.debug "📤 Body (${batch.size()} events):"
         batch.each { evt ->
             log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, is_reachable: ${evt.is_reachable}, sequence=${evt.sequence_number}"
@@ -1208,7 +1223,7 @@ private Map _doCorePost(List batch, boolean isRetry) {
     if (isRetry) log.info "🔄 RETRY: Attempting Core post with refreshed token..."
 
     Map params = [
-        uri: CORE_INGEST_URL,
+        uri: coreIngestUrl(),
         contentType: "application/json",
         requestContentType: "application/json",
         timeout: timeoutSec,
