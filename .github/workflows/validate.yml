@@ -1,0 +1,22 @@
+# Runs on every push and pull request: the manifest, the app and the two
+# drivers must agree on the version, every code location must be pinned to
+# the release tag for that version, and every beta location must track dev.
+# See scripts/check_manifest.py for the full list.
+name: Validate
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  manifest:
+    name: manifest and version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_manifest.py

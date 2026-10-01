@@ -1,5 +1,13 @@
+import groovy.transform.Field
+
+// Must equal "version" in packageManifest.json (scripts/check_manifest.py
+// enforces it). Recorded on the device as the "driverVersion" data value so
+// a hub's installed driver build can be identified.
+@Field static final String DRIVER_VERSION = "1.0.8"
+
 metadata {
-    definition(name: "SmartFilterPro Reset Button", namespace: "smartfilterpro", author: "Eric Hanfman") {
+    definition(name: "SmartFilterPro Reset Button", namespace: "smartfilterpro", author: "Eric Hanfman",
+               importUrl: "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/SmartFilterProResetButton.groovy") {
         capability "Actuator"
         capability "PushableButton"
         attribute "lastReset", "STRING"
@@ -7,12 +15,14 @@ metadata {
 }
 
 def installed() {
-    log.info "SmartFilterPro Reset Button installed"
+    log.info "SmartFilterPro Reset Button installed (v${DRIVER_VERSION})"
+    updateDataValue("driverVersion", DRIVER_VERSION)
     sendEvent(name: "numberOfButtons", value: 1)
 }
 
 def updated() {
-    log.info "SmartFilterPro Reset Button updated"
+    log.info "SmartFilterPro Reset Button updated (v${DRIVER_VERSION})"
+    updateDataValue("driverVersion", DRIVER_VERSION)
     sendEvent(name: "numberOfButtons", value: 1)
 }
 
