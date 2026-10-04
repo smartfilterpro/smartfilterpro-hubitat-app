@@ -32,7 +32,7 @@ import groovy.transform.Field
 // APP_VERSION must equal "version" in packageManifest.json (and
 // DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
 // CI; the release workflow tags main as v<version> once they agree.
-@Field static final String  APP_VERSION = "1.0.8"
+@Field static final String  APP_VERSION = "1.0.9"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
@@ -52,6 +52,29 @@ import groovy.transform.Field
 // device per window; Mode_Change and CONNECTIVITY_CHANGE are never
 // throttled.
 @Field static final Long TELEMETRY_MIN_INTERVAL_MS = 60000L
+
+// Runtime checkpoints. Core rejects any single runtime_seconds over 24h, so
+// a run reported only as one total when it ends (a fan left "on" for days)
+// was lost entirely, and nothing showed while it ran. Instead, while a run
+// continues, runtimeCheckpoint() (every 15 minutes) confirms with the hub
+// that the thermostat is still reachable and running the same way and posts
+// the runtime since the previous report (runtime_type CHECKPOINT). Every
+// END, mode switch and forced close carries only the runtime not yet
+// reported. Pieces are contiguous whole seconds, so Core joins them into one
+// session and splits it at local midnight. Contract: core-ingest
+// docs/EVENT_SCHEMA.md, "Runtime: END totals and checkpoints".
+@Field static final Long CHECKPOINT_INTERVAL_MS = 900000L      // 15 min
+// Runtime is only counted while something confirms the session: an event
+// from the thermostat, or a scheduled check that finds it reachable. With no
+// confirmation for this long (hub off, device not reporting) the session is
+// closed AT its last confirmation, and the next confirmation that shows the
+// equipment running starts a new session. The gap is never counted.
+@Field static final Long UNCONFIRMED_LIMIT_MS = 3600000L       // 1 h
+// Longest single piece posted. Normal checkpoints are ~15 min; this only
+// splits catch-up after a reboot, or a session started by an older version.
+@Field static final Long MAX_PIECE_SECONDS = 3600L
+// A scheduled check that finds less than this unreported only confirms.
+@Field static final Long MIN_CHECKPOINT_SECONDS = 60L
 
 /* ============================== METADATA ============================== */
 
@@ -239,6 +262,17 @@ def statusPage() {
             paragraph "Dropped (lifetime): ${dropCount}"
             if (dropCount > 0 && lastDropAt) {
                 paragraph "Last drop: ${((now() - lastDropAt) / 1000L) as Integer}s ago"
+            }
+        }
+        section("Runtime Session") {
+            String rtKey = settings.thermostat ? _rtKey(settings.thermostat) : null
+            Map rt = _rtSession(rtKey)
+            if (rt) {
+                paragraph "Running: ${rt.status} since ${new Date(rt.startMs as Long)}"
+                paragraph "Reported to Core up to: ${new Date(rt.reportedUntilMs as Long)}"
+                paragraph "Last confirmed: ${new Date(_rtConfirmed(rtKey, rt))}"
+            } else {
+                paragraph "No open session (${_rtLastStatus(rtKey) ?: 'Idle'})"
             }
         }
         section("Polled from ha_therm_status") {
@@ -611,6 +645,13 @@ def initialize() {
     runEvery30Minutes("heartbeat")
     runEvery5Minutes("checkDeviceHealth")
 
+    // Runtime checkpoint schedule and the hub-restart hook (see
+    // _ensureRuntimeHooks), then re-check the thermostat now: a run may
+    // have stopped, or gone unconfirmed, while the app was not watching.
+    state.runtimeHooksVersion = null
+    _ensureRuntimeHooks()
+    runIn(10, "runtimeCheckNow")
+
     // Reliable-delivery outbox safety-net timer. Drains any batches
     // whose nextAttemptAt has elapsed. Fresh POST successes also
     // trigger a drain via runIn(0) — this timer is the fallback for
@@ -642,6 +683,12 @@ def heartbeat() {
 }
 
 def checkDeviceHealth() {
+    // Runs every 5 minutes on every install, including hubs that received
+    // this version through Hubitat Package Manager without the user pressing
+    // Done (which is what runs initialize()). Installs the runtime checkpoint
+    // schedule there too.
+    _ensureRuntimeHooks()
+
     if (!settings.thermostat) return
 
     boolean wasReachable = (state.lastKnownReachable != null) ? state.lastKnownReachable : true
@@ -654,9 +701,14 @@ def checkDeviceHealth() {
 
         // Send a status update to Core
         if (state.sfpAccessToken) {
-            String op = settings.thermostat.currentThermostatOperatingState ?: "idle"
-            String fanMode = settings.thermostat.currentThermostatFanMode ?: "auto"
-            String equipmentStatus = classifyState(op, fanMode, false)
+            // Going offline: first report an open run up to its last
+            // confirmation. Core skips runtime stamped before events it has
+            // already processed, so that runtime must not wait for the
+            // close (an hour later, stamped at the confirmation, i.e.
+            // before this offline event).
+            if (!isReachable) _flushConfirmedRuntime(settings.thermostat, now() as Long)
+
+            String equipmentStatus = _deviceStatus(settings.thermostat)
 
             Map payload = buildCoreEventFromDevice(
                 settings.thermostat,
@@ -689,14 +741,20 @@ private String classifyState(String operatingState, String fanMode, boolean chec
     String op = (operatingState ?: "idle").toLowerCase()
     String fan = (fanMode ?: "auto").toLowerCase()
 
-    boolean coolingActive = op.contains("cool")
-    boolean heatingActive = op.contains("heat")
+    // "pending heat" / "pending cool" mean the thermostat is WAITING to
+    // start (e.g. a compressor delay): the equipment is not running yet.
+    // They contain "heat"/"cool", so without this they counted as runtime.
+    // Same as the other bridges: pending is not running (the fan still is
+    // when it is set to on/circulate, below).
+    boolean pending = op.contains("pending")
+    boolean coolingActive = !pending && op.contains("cool")
+    boolean heatingActive = !pending && op.contains("heat")
     boolean fanExplicitlyOn = (fan in ["on", "circulate"])
     boolean fanOnlyMode = (op == "fan only")
 
     // Check for auxiliary/emergency heat
     // Hubitat may report this in operatingState or we check thermostatMode
-    boolean isAuxHeat = checkAuxHeat && (op.contains("emergency") || op.contains("aux"))
+    boolean isAuxHeat = checkAuxHeat && !pending && (op.contains("emergency") || op.contains("aux"))
 
     // Residential forced-air systems always run the fan during heating/cooling,
     // so default to _Fan variants for accurate runtime tracking
@@ -801,6 +859,8 @@ def handleEvent(evt) {
         return
     }
 
+    Long nowMs = now() as Long
+
     String op = dev.currentThermostatOperatingState?.toLowerCase() ?: "idle"
     String fanMode = dev.currentThermostatFanMode?.toLowerCase() ?: "auto"
     String thermostatMode = dev.currentThermostatMode?.toLowerCase() ?: "auto"
@@ -820,27 +880,28 @@ def handleEvent(evt) {
         log.debug "🔄 Thermostat mode changed: ${lastThermostatMode} → ${thermostatMode}"
     }
 
+    // Runtime session bookkeeping (see CHECKPOINT_INTERVAL_MS). A session
+    // nobody confirmed for over UNCONFIRMED_LIMIT_MS is closed at its last
+    // confirmation BEFORE this event is handled; this event then confirms
+    // what the thermostat is doing now (and starts a new session if it is
+    // running).
+    String k = _rtPrepare(dev, nowMs)
+    _closeIfUnconfirmed(dev, k, nowMs)
+    _rtMarkConfirmed(k, nowMs)
+    Map session = _rtSession(k)
+
     // Classify current state using 8-state system
     String equipmentStatus = classifyState(op, fanMode, true)
-    boolean isActive = (equipmentStatus != "Idle") 
+    boolean isActive = (equipmentStatus != "Idle")
+
+    boolean wasActive = (session != null)
+    String lastEquipmentStatus = session ? (session.status as String) : (_rtLastStatus(k) ?: "Idle")
 
     if (enableDebugLogging) {
         log.debug "📊 State: op=${op}, fanMode=${fanMode}, thermostatMode=${thermostatMode}, equipment_status=${equipmentStatus}, isActive=${isActive}, isStateChange=${isStateChangingEvent}"
     }
 
-    String keyStart = "sessionStart_${uid}-${devId}"
-    String keyWas   = "wasActive_${uid}-${devId}"
-    String keyLastType = "lastEquipmentStatus_${uid}-${devId}"
-    String keyLastRuntimePost = "lastRuntimePost_${uid}-${devId}"
-
-    boolean wasActive = (state[keyWas] as Boolean) ?: false
-    String lastEquipmentStatus = state[keyLastType] ?: "Idle"
-
     boolean equipmentModeChanged = (equipmentStatus != lastEquipmentStatus)
-
-    // Debounce: Check if we recently posted runtime (within 5 seconds) to prevent race condition
-    Long lastRuntimePostTime = (state[keyLastRuntimePost] as Long) ?: 0
-    boolean recentlyPostedRuntime = (now() - lastRuntimePostTime) < 5000
 
     // Handle thermostat mode change (environmental update)
     if (thermostatModeChanged && !equipmentModeChanged && !isStateChangingEvent) {
@@ -853,7 +914,7 @@ def handleEvent(evt) {
         }
 
         // ✅ Use "Mode_Change" for event_type, but current state for equipment_status
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive, isReachable)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, isActive, isReachable, nowMs)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -865,8 +926,15 @@ def handleEvent(evt) {
     if (!isStateChangingEvent && !equipmentModeChanged) {
         if (enableDebugLogging) log.debug "📊 Telemetry update (environmental change)"
 
+        // Core keeps ONE event per (device, event_type, equipment_status,
+        // recorded_at). Checkpoints are Telemetry_Updates that end on the
+        // open session's whole-second grid (start + n s); a plain one posted
+        // on that exact millisecond first would make Core drop the
+        // checkpoint, runtime and all. Keep plain telemetry off the grid.
+        Long telemetryMs = (session && ((nowMs - (session.startMs as Long)) % 1000L) == 0L) ? nowMs + 1L : nowMs
+
         // ✅ Use "Telemetry_Update" for event_type, but current state for equipment_status
-        Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive, isReachable)
+        Map payload = buildCoreEventFromDevice(dev, "Telemetry_Update", null, equipmentStatus, isActive, isReachable, telemetryMs)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -881,101 +949,30 @@ def handleEvent(evt) {
         return
     }
 
-    // Calculate runtime if transitioning (with debounce to prevent double-posting)
-    Integer runtimeSeconds = null
-    if (equipmentModeChanged && wasActive && state[keyStart] && !recentlyPostedRuntime) {
-        // Set debounce timestamp FIRST to "claim" this runtime calculation
-        // This prevents concurrent events from also calculating runtime
-        state[keyLastRuntimePost] = now()
-
-        Long start = (state[keyStart] as Long)
-        if (start) {
-            runtimeSeconds = Math.max(0L, ((now() - start) / 1000L) as int)
-            if (enableDebugLogging) log.debug "⏱️ Runtime calculated: ${runtimeSeconds}s (was ${lastEquipmentStatus})"
-        }
-    } else if (recentlyPostedRuntime && equipmentModeChanged && wasActive) {
-        if (enableDebugLogging) log.debug "⏭️ Skipping duplicate runtime calculation (debounce active)"
-    }
-
     // Session START (inactive → active)
     if (isActive && !wasActive) {
-        state[keyStart] = now()
         if (enableDebugLogging) log.debug "🏁 Session START: ${equipmentStatus}"
-
-        // Update state BEFORE posting to prevent race conditions with concurrent events
-        state[keyWas] = true
-        state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
-
-        if (!_claimModeChangeSlot(equipmentStatus)) {
-            return
-        }
-
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true, isReachable)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-
-        _postToCoreWithJwt(payload)
+        _startSession(dev, k, equipmentStatus, nowMs, isReachable, lastEquipmentStatus)
         return
     }
 
-    // Session END (active → inactive)
-    if (!isActive && wasActive) {
-        // Skip if this transition was already handled by a recent event (race condition protection)
-        if (recentlyPostedRuntime && runtimeSeconds == null) {
-            if (enableDebugLogging) log.debug "⏭️ Skipping duplicate Session END (already posted by concurrent event)"
-            state[keyWas] = false
-            state[keyLastType] = equipmentStatus
-            return
-        }
-
-        // Clear session start and update state BEFORE posting to prevent race conditions
-        // This ensures concurrent events see the updated state immediately
-        state.remove(keyStart)
-        state[keyWas] = false
-        state[keyLastType] = equipmentStatus
+    // Session END (active → inactive) or equipment mode switch while active
+    // (Heating → Cooling, etc.). Both report ONLY the runtime not yet
+    // reported by a checkpoint, under the status that ran.
+    //
+    // This replaces a 5 s "recently posted runtime" debounce that skipped
+    // the second of two quick transitions: on an active → active switch it
+    // left the session start in place, so the next segment's runtime
+    // included the skipped segment's time under the wrong status. Duplicate
+    // handling of ONE transition (two attribute events for the same change)
+    // is now prevented by claiming the session in atomicState before
+    // posting (_rtReplaceSession), and, if two handlers still race, by the
+    // piece's deterministic source_event_id, which Core dedupes.
+    if (wasActive && equipmentModeChanged) {
+        if (enableDebugLogging) log.debug "${isActive ? '🔄 Equipment mode switch' : '🛑 Session END'}: ${lastEquipmentStatus} → ${equipmentStatus}"
         state[keyLastThermostatMode] = thermostatMode
-
-        if (enableDebugLogging) log.debug "🛑 Session END: ${lastEquipmentStatus} -> Idle (runtime=${runtimeSeconds}s)"
-
-        if (!_claimModeChangeSlot(equipmentStatus)) {
-            return
-        }
-
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, false, isReachable)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-
-        _postToCoreWithJwt(payload)
-        return
-    }
-
-    // Equipment mode changed while active (Heating → Cooling, etc.)
-    if (isActive && equipmentModeChanged) {
-        // Skip if this transition was already handled by a recent event (race condition protection)
-        if (recentlyPostedRuntime && runtimeSeconds == null) {
-            if (enableDebugLogging) log.debug "⏭️ Skipping duplicate mode switch (already posted by concurrent event)"
-            state[keyLastType] = equipmentStatus
-            return
-        }
-
-        // Update state BEFORE posting to prevent race conditions with concurrent events
-        state[keyStart] = now()
-        state[keyWas] = true
-        state[keyLastType] = equipmentStatus
-        state[keyLastThermostatMode] = thermostatMode
-
-        if (enableDebugLogging) log.debug "🔄 Equipment mode switch: ${lastEquipmentStatus} → ${equipmentStatus} (runtime=${runtimeSeconds}s)"
-
-        if (!_claimModeChangeSlot(equipmentStatus)) {
-            return
-        }
-
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", runtimeSeconds, equipmentStatus, true, isReachable)
-        payload.previous_status = lastEquipmentStatus
-        state.sfpLastCorePayload = payload
-
-        _postToCoreWithJwt(payload)
+        _endSession(dev, k, session, nowMs, equipmentStatus, isReachable, isActive ? "switch" : "end")
         return
     }
 
@@ -984,15 +981,13 @@ def handleEvent(evt) {
         if (enableDebugLogging) log.debug "🔄 State change: ${evt.name} changed to ${evt.value}"
 
         // Update state BEFORE posting to prevent race conditions with concurrent events
-        state[keyWas] = true
-        state[keyLastType] = equipmentStatus
         state[keyLastThermostatMode] = thermostatMode
 
         if (!_claimModeChangeSlot(equipmentStatus)) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true, isReachable)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, true, isReachable, nowMs)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -1005,15 +1000,14 @@ def handleEvent(evt) {
         if (enableDebugLogging) log.debug "🔄 State change while idle: ${evt.name} changed to ${evt.value}"
 
         // Update state BEFORE posting to prevent race conditions with concurrent events
-        state[keyWas] = false
-        state[keyLastType] = equipmentStatus
+        _rtSetLastStatus(k, equipmentStatus)
         state[keyLastThermostatMode] = thermostatMode
 
         if (!_claimModeChangeSlot(equipmentStatus)) {
             return
         }
 
-        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false, isReachable)
+        Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, equipmentStatus, false, isReachable, nowMs)
         payload.previous_status = lastEquipmentStatus
         state.sfpLastCorePayload = payload
 
@@ -1021,9 +1015,380 @@ def handleEvent(evt) {
         return
     }
 }
+
+/* ============================== RUNTIME SESSIONS / CHECKPOINTS ============================== */
+
+// Session state lives in atomicState, keyed per user + thermostat:
+//   rtSession_<k>    open session: [status, startMs, reportedUntilMs], or absent when idle
+//   rtConfirmed_<k>  last time the thermostat's state was confirmed (epoch ms)
+//   rtLastStatus_<k> last classified equipment status (also "Idle")
+// atomicState (not state) because the scheduled checkpoint and attribute
+// events run concurrently, and plain state is only saved when a handler
+// returns. Hub state survives reboots, so a session resumes from its last
+// report (or is closed at its last confirmation if that is over an hour old).
+
+/** Scheduled every 15 minutes (see _ensureRuntimeHooks). */
+def runtimeCheckpoint() {
+    def dev = settings.thermostat
+    if (!dev || !state.sfpAccessToken || !state.sfpHvacId) return
+    try {
+        _runtimeCheck(dev, now() as Long)
+    } catch (Exception e) {
+        log.error "❌ Runtime checkpoint failed: ${e.message}"
+    }
+}
+
+/**
+ * One-off re-check (after initialize() or a restart). A separate handler
+ * from the 15-minute schedule so runIn's overwrite can't replace it.
+ */
+def runtimeCheckNow() {
+    runtimeCheckpoint()
+}
+
+/**
+ * location "systemStart": the hub rebooted. Ask the thermostat for fresh
+ * values (a stop may have happened while the hub was down, and the cached
+ * attribute would still say running), then re-check shortly after.
+ */
+def hubRestarted(evt) {
+    log.info "🔁 Hub restarted — re-checking the runtime session"
+    def dev = settings.thermostat
+    if (dev && state.sfpAccessToken) {
+        String k = _rtKey(dev)
+        if (k && _rtSession(k)) {
+            try {
+                if (dev.hasCommand("refresh")) dev.refresh()
+            } catch (Exception e) {
+                logDebug "Thermostat refresh after restart failed: ${e.message}"
+            }
+        }
+    }
+    runIn(60, "runtimeCheckNow")
+}
+
+/**
+ * Install the checkpoint schedule and the restart hook once per app
+ * version. Called from initialize() and from checkDeviceHealth(), whose
+ * 5-minute schedule already exists on every hub, so an update that never
+ * ran initialize() still gets checkpoints.
+ */
+private void _ensureRuntimeHooks() {
+    if (state.runtimeHooksVersion == APP_VERSION) return
+    runEvery15Minutes("runtimeCheckpoint")
+    subscribe(location, "systemStart", "hubRestarted")
+    state.runtimeHooksVersion = APP_VERSION
+    log.info "⏱️ Runtime checkpoints scheduled every ${(CHECKPOINT_INTERVAL_MS / 60000L) as Integer} min"
+}
+
+/**
+ * Confirm the thermostat's current state with the hub and act on it:
+ *   - open session unconfirmed for over an hour: close it at its last
+ *     confirmation (whatever happened since is unknown)
+ *   - thermostat not reachable: no confirmation, nothing else to do
+ *   - still running the same way: post a checkpoint
+ *   - stopped or switched without the app seeing the event: handle it like
+ *     that event, at the time the hub recorded the change
+ *   - running with no session (start missed, or closed unconfirmed): start
+ *     a new session now
+ */
+private void _runtimeCheck(def dev, Long nowMs) {
+    String k = _rtPrepare(dev, nowMs)
+    if (!k) return
+    _closeIfUnconfirmed(dev, k, nowMs)
+
+    if (!checkDeviceReachable(dev)) {
+        if (_rtSession(k)) log.warn "⚠️ Runtime check: thermostat not reachable — session not confirmed"
+        return
+    }
+
+    Map session = _rtSession(k)
+    Long prevConfirmed = _rtConfirmed(k, session)
+    _rtMarkConfirmed(k, nowMs)
+    String status = _deviceStatus(dev)
+
+    if (session && session.status == status) {
+        _postCheckpoint(dev, k, session, nowMs, true, MIN_CHECKPOINT_SECONDS)
+        return
+    }
+
+    if (session) {
+        // When the change happened: the hub's timestamp on the attribute,
+        // else the previous confirmation (never counting unconfirmed time).
+        Long changedAt = _statusChangedAt(dev) ?: prevConfirmed
+        Long endMs = Math.min(nowMs, Math.max(changedAt, session.reportedUntilMs as Long))
+        log.warn "⚠️ Runtime check: thermostat is ${status}, app was tracking ${session.status} — handling the missed change at ${new Date(endMs).toInstant()}"
+        _endSession(dev, k, session, endMs, status, true, "missed")
+        return
+    }
+
+    if (status != "Idle") {
+        log.warn "⚠️ Runtime check: thermostat is ${status} with no open session — starting one now"
+        _startSession(dev, k, status, nowMs, true, _rtLastStatus(k) ?: "Idle")
+    }
+}
+
+/**
+ * Close an open session whose last confirmation is more than
+ * UNCONFIRMED_LIMIT_MS ago, AT that confirmation. Returns true if closed.
+ */
+private boolean _closeIfUnconfirmed(def dev, String k, Long nowMs) {
+    Map session = _rtSession(k)
+    if (!session) return false
+    Long confirmed = _rtConfirmed(k, session)
+    if (nowMs - confirmed <= UNCONFIRMED_LIMIT_MS) return false
+    log.warn "⚠️ ${session.status} session not confirmed for ${((nowMs - confirmed) / 60000L) as Integer} min — closing it at the last confirmation (${new Date(confirmed).toInstant()})"
+    _endSession(dev, k, session, confirmed, "Idle", checkDeviceReachable(dev), "unconfirmed")
+    return true
+}
+
+/**
+ * Report an open session up to its last confirmation (before an offline
+ * event). The confirmation is usually an event whose Telemetry_Update was
+ * posted at that instant, and Core skips runtime stamped before events it
+ * already processed, so the piece ends on the first whole second AFTER the
+ * confirmation (less than a second past it), never at or before it.
+ */
+private void _flushConfirmedRuntime(def dev, Long nowMs) {
+    String k = _rtKey(dev)
+    if (!k) return
+    Map session = _rtSession(k)
+    if (!session) return
+    Long fromMs = session.reportedUntilMs as Long
+    Long confirmed = _rtConfirmed(k, session)
+    if (confirmed <= fromMs) return
+    Long toMs = fromMs + ((((confirmed - fromMs) as long).intdiv(1000L) as long) + 1L) * 1000L
+    _postCheckpoint(dev, k, session, Math.min(nowMs, toMs), true, 1L)
+}
+
+/** Open a session at atMs and post the START Mode_Change. */
+private void _startSession(def dev, String k, String status, Long atMs, boolean reachable, String previousStatus) {
+    Map next = [status: status, startMs: atMs, reportedUntilMs: atMs]
+    if (!_rtReplaceSession(k, null, next)) {
+        logDebug "⏭️ Session already started by a concurrent handler"
+        return
+    }
+    _rtSetLastStatus(k, status)
+    _rtMarkConfirmed(k, atMs)
+
+    if (!_claimModeChangeSlot(status)) return
+
+    Map payload = buildCoreEventFromDevice(dev, "Mode_Change", null, status, true, reachable, atMs)
+    payload.previous_status = previousStatus
+    state.sfpLastCorePayload = payload
+    _postToCoreWithJwt(payload)
+}
+
+/**
+ * End the open session at endMs: post the runtime not yet reported, under
+ * the status that ran, as a Mode_Change whose equipment_status is
+ * newStatus. When newStatus is active (a mode switch) a new session starts
+ * where the old one's reported runtime ends.
+ *
+ * The session is claimed (replaced in atomicState) BEFORE posting, so a
+ * concurrent handler can't report the same time again. Runtime is never
+ * subject to the Mode_Change dedup window: the old code cleared the session
+ * and then let the dedup drop the END, losing the session's runtime.
+ */
+private void _endSession(def dev, String k, Map session, Long endMs, String newStatus, boolean reachable, String reason) {
+    String oldStatus = session.status as String
+    Long startMs = session.startMs as Long
+    Long fromMs = session.reportedUntilMs as Long
+    List pieces = _runtimePieces(fromMs, endMs)
+    Map last = pieces ? (pieces.last() as Map) : [fromMs: fromMs, seconds: 0L, toMs: fromMs]
+    boolean newActive = (newStatus != "Idle")
+
+    Map next = newActive ? [status: newStatus, startMs: last.toMs, reportedUntilMs: last.toMs] : null
+    if (!_rtReplaceSession(k, session, next)) {
+        logDebug "⏭️ ${oldStatus} session already ended by a concurrent handler"
+        return
+    }
+    _rtSetLastStatus(k, newStatus)
+
+    List batch = []
+    // A long remainder (only after a restart or an upgrade mid-run) is
+    // split; all but the last piece are checkpoints of the old status.
+    if (pieces.size() > 1) {
+        pieces.subList(0, pieces.size() - 1).each { batch << _checkpointEvent(dev, oldStatus, startMs, it as Map, reachable) }
+    }
+    Map payload = buildCoreEventFromDevice(dev, "Mode_Change", (last.seconds as Long).intValue(), newStatus, newActive, reachable, last.toMs as Long)
+    payload.previous_status = oldStatus
+    payload.source_event_id = _pieceId(startMs, last.fromMs as Long)
+    batch << payload
+
+    Long totalSeconds = (pieces.sum { it.seconds as Long } ?: 0L) as Long
+    log.info "⏱️ ${oldStatus} ${reason}: +${totalSeconds}s since last report → ${newStatus}"
+
+    boolean slotFree = _claimModeChangeSlot(newStatus)
+    if (!slotFree && totalSeconds == 0L) return   // nothing but a duplicate state change
+
+    state.sfpLastCorePayload = payload
+    _postToCoreWithJwt(batch.size() == 1 ? batch[0] : batch)
+}
+
+/**
+ * Post the open session's runtime since the last report, up to toMs, as
+ * CHECKPOINT pieces, if at least minSeconds are unreported.
+ */
+private void _postCheckpoint(def dev, String k, Map session, Long toMs, boolean reachable, Long minSeconds) {
+    List pieces = _runtimePieces(session.reportedUntilMs as Long, toMs)
+    Long total = (pieces.sum { it.seconds as Long } ?: 0L) as Long
+    if (total < minSeconds) return
+
+    Map next = [status: session.status, startMs: session.startMs, reportedUntilMs: (pieces.last() as Map).toMs]
+    if (!_rtReplaceSession(k, session, next)) {
+        logDebug "⏭️ Checkpoint skipped: session changed concurrently"
+        return
+    }
+    List batch = pieces.collect { _checkpointEvent(dev, session.status as String, session.startMs as Long, it as Map, reachable) }
+    log.info "⏱️ Checkpoint ${session.status}: +${total}s"
+    _postToCoreWithJwt(batch.size() == 1 ? batch[0] : batch)
+}
+
+/** A CHECKPOINT event for one piece (contract: core-ingest EVENT_SCHEMA.md). */
+private Map _checkpointEvent(def dev, String status, Long startMs, Map piece, boolean reachable) {
+    Map evt = buildCoreEventFromDevice(dev, "Telemetry_Update", (piece.seconds as Long).intValue(), status, true, reachable, piece.toMs as Long)
+    evt.previous_status = status
+    evt.runtime_type = "CHECKPOINT"
+    evt.source_event_id = _pieceId(startMs, piece.fromMs as Long)
+    return evt
+}
+
+/**
+ * Deterministic id of the runtime piece that starts at fromMs in the
+ * session that started at startMs. A retry or gap resend of the same event
+ * dedupes in Core, and so does a second report of the same piece by a
+ * concurrent handler (checkpoint and END share the scheme for that reason).
+ */
+private String _pieceId(Long startMs, Long fromMs) {
+    return "hubitat-rt:${startMs}:${fromMs}"
+}
+
+/**
+ * Split fromMs..toMs into contiguous whole-second pieces of at most
+ * MAX_PIECE_SECONDS: [fromMs, seconds, toMs]. Each piece ends exactly
+ * seconds*1000 after it starts, so consecutive pieces join up in Core; the
+ * sub-second remainder stays unreported for the next piece.
+ */
+private List _runtimePieces(Long fromMs, Long toMs) {
+    List pieces = []
+    if (fromMs == null || toMs == null || toMs <= fromMs) return pieces
+    long remaining = ((toMs - fromMs) as long).intdiv(1000L) as long
+    long cursor = fromMs as long
+    while (remaining > 0L) {
+        long secs = Math.min(remaining, MAX_PIECE_SECONDS as long)
+        pieces << [fromMs: cursor, seconds: secs, toMs: cursor + secs * 1000L]
+        cursor += secs * 1000L
+        remaining -= secs
+    }
+    return pieces
+}
+
+/** Equipment status the hub currently shows, classified like events are. */
+private String _deviceStatus(def dev) {
+    return classifyState(dev.currentValue("thermostatOperatingState") as String, dev.currentValue("thermostatFanMode") as String, true)
+}
+
+/** When the hub last recorded a change to the attributes the status comes from. */
+private Long _statusChangedAt(def dev) {
+    Long latest = null
+    ["thermostatOperatingState", "thermostatFanMode"].each { String attr ->
+        try {
+            Long t = dev.currentState(attr)?.date?.time as Long
+            if (t != null && (latest == null || t > latest)) latest = t
+        } catch (Exception e) { /* attribute not supported */ }
+    }
+    return latest
+}
+
+// Same "<user>-<device>" suffix the per-device state keys always used.
+private String _rtKey(def dev) {
+    String devId = dev?.getId()?.toString()
+    return devId ? "${state.sfpUserId}-${devId}".toString() : null
+}
+
+private Map _rtSession(String k) {
+    if (!k) return null
+    Map s = atomicState["rtSession_${k}"] as Map
+    if (!s || !s.status || s.startMs == null) return null
+    return [status: s.status as String, startMs: s.startMs as Long,
+            reportedUntilMs: (s.reportedUntilMs != null ? s.reportedUntilMs : s.startMs) as Long]
+}
+
+/**
+ * Replace the open session if it is still `expected` (null = none open).
+ * Re-reads atomicState right before writing so a concurrent handler that
+ * already moved the session on wins and this caller backs off.
+ */
+private boolean _rtReplaceSession(String k, Map expected, Map next) {
+    if (!k) return false
+    Map current = _rtSession(k)
+    boolean same = (expected == null) ? (current == null) :
+        (current != null && current.status == expected.status &&
+         (current.startMs as Long) == (expected.startMs as Long) &&
+         (current.reportedUntilMs as Long) == (expected.reportedUntilMs as Long))
+    if (!same) return false
+    if (next) atomicState["rtSession_${k}"] = next
+    else atomicState.remove("rtSession_${k}")
+    return true
+}
+
+private String _rtLastStatus(String k) {
+    return k ? (atomicState["rtLastStatus_${k}"] as String) : null
+}
+
+private void _rtSetLastStatus(String k, String status) {
+    if (k) atomicState["rtLastStatus_${k}"] = status
+}
+
+/** Last confirmation of the open session: never earlier than what was reported. */
+private Long _rtConfirmed(String k, Map session) {
+    Long c = k ? (atomicState["rtConfirmed_${k}"] as Long) : null
+    Long floor = session ? Math.max(session.startMs as Long, session.reportedUntilMs as Long) : 0L
+    return Math.max(c ?: 0L, floor)
+}
+
+private void _rtMarkConfirmed(String k, Long atMs) {
+    if (!k) return
+    Long c = atomicState["rtConfirmed_${k}"] as Long
+    if (c == null || atMs > c) atomicState["rtConfirmed_${k}"] = atMs
+}
+
+/**
+ * Key for the runtime state, migrating a session started by a version
+ * before checkpoints (plain state: sessionStart_/wasActive_/
+ * lastEquipmentStatus_) on first use. Nothing of that run was reported
+ * yet; it counts up to the thermostat's last activity on the hub (its last
+ * confirmation), and the first check reports it in pieces.
+ */
+private String _rtPrepare(def dev, Long nowMs) {
+    String k = _rtKey(dev)
+    if (!k || atomicState["rtLastStatus_${k}"] != null) return k
+
+    Long legacyStart = state["sessionStart_${k}"] as Long
+    boolean legacyActive = (state["wasActive_${k}"] as Boolean) ?: false
+    String legacyStatus = state["lastEquipmentStatus_${k}"] as String
+    String lastStatus = "Idle"
+    if (legacyActive && legacyStart && legacyStatus && legacyStatus != "Idle" && atomicState["rtSession_${k}"] == null) {
+        lastStatus = legacyStatus
+        Long seen = null
+        try { seen = dev.getLastActivity()?.time as Long } catch (Exception e) { /* not available */ }
+        Long confirmed = Math.min(nowMs, Math.max(legacyStart, seen ?: legacyStart))
+        atomicState["rtSession_${k}"] = [status: legacyStatus, startMs: legacyStart, reportedUntilMs: legacyStart]
+        atomicState["rtConfirmed_${k}"] = confirmed
+        log.info "⏱️ Took over the ${legacyStatus} session started ${new Date(legacyStart).toInstant()} (last confirmed ${new Date(confirmed).toInstant()})"
+    }
+    atomicState["rtLastStatus_${k}"] = lastStatus
+    ["sessionStart_", "wasActive_", "lastEquipmentStatus_", "lastRuntimePost_"].each { state.remove("${it}${k}".toString()) }
+    return k
+}
+
 /* ============================== PAYLOAD BUILDER - 8-STATE SYSTEM ============================== */
 
-private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeSeconds = null, String equipmentStatus = null, Boolean overrideIsActive = null, Boolean overrideIsReachable = null) {
+// atMs: the event time (epoch ms) for timestamp/recorded_at/observed_at,
+// default now. A runtime piece is stamped at its END, because Core takes
+// the span as timestamp - runtime_seconds .. timestamp.
+private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeSeconds = null, String equipmentStatus = null, Boolean overrideIsActive = null, Boolean overrideIsReachable = null, Long atMs = null) {
     String userId = state.sfpUserId
     String deviceId = dev.getId().toString()
     String label = dev.label ?: dev.displayName ?: dev.name
@@ -1055,7 +1420,7 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
     // Allow override for health check scenarios
     boolean isReachable = (overrideIsReachable != null) ? overrideIsReachable : true
 
-    String ts = new Date().toInstant().toString()
+    String ts = new Date((atMs != null ? atMs : now()) as Long).toInstant().toString()
 
     // Use 8-state equipment status
 	String finalEquipStatus = equipmentStatus ?: "Idle"
@@ -1123,26 +1488,30 @@ private Map buildCoreEventFromDevice(def dev, String eventType, Integer runtimeS
 /**
  * Public entrypoint for posting events to Core.
  *
- * Responsibilities:
- *   - Validate / refresh the core_token before trying
+ * Ports the bridge-core delivery semantics (sequence number + outbound log
+ * BEFORE the POST, retry transports, never resend rejections):
+ *   - Reserve a sequence number per event (reserveSequenceNumber: seeded
+ *     with epoch ms, monotonic per device, in atomicState)
  *   - Buffer each event into state.eventBuffer for gap backfill
  *     (the ONLY place that calls addToEventBuffer in the fresh path)
+ *   - Write the batch to the outbox (atomicState, persisted immediately
+ *     and across reboots) BEFORE the POST, so a hub that dies or reboots
+ *     mid-send retries it from the outbox instead of losing it. Plain
+ *     state (the event buffer) is only saved when the handler returns.
+ *   - No valid core_token: keep the batch in the outbox for drainOutbox,
+ *     which refreshes the token, instead of dropping it
  *   - Call _doCorePost for the actual HTTP work
- *   - On "ok": handle gaps, schedule a piggyback outbox drain
- *   - On "permanent": log, bump dropped counter, return false
- *   - On "transient": enqueue the batch for retry, return false
+ *   - On "ok": remove it from the outbox, handle gaps, schedule a
+ *     piggyback outbox drain
+ *   - On "permanent": remove it, log, bump dropped counter, return false
+ *   - On "transient": leave it in the outbox for retry, return false
  *
- * Returns true only if the POST actually succeeded. An enqueued
- * transient failure returns false so callers can still reason about
+ * Returns true only if the POST actually succeeded. A queued transient
+ * failure returns false so callers can still reason about
  * "did this event reach Core right now" vs. "is it queued."
  */
 private boolean _postToCoreWithJwt(Object body) {
     if (enableDebugLogging) log.debug "🚀 _postToCoreWithJwt called"
-
-    if (!_ensureCoreTokenValid()) {
-        log.warn "❌ No valid core_token available; skipping Core post"
-        return false
-    }
 
     List batch = (body instanceof List) ? (body as List) : [body]
 
@@ -1163,17 +1532,28 @@ private boolean _postToCoreWithJwt(Object body) {
     // sole entry point into addToEventBuffer.
     batch.each { addToEventBuffer(it as Map) }
 
+    // Outbound log before the POST. Retried no sooner than the first
+    // backoff step, so the drain doesn't race this attempt.
+    boolean queued = enqueueOutbox(batch, "in_flight")
+
+    if (!_ensureCoreTokenValid()) {
+        log.warn "❌ No valid core_token available; ${queued ? 'kept ' + batch.size() + ' event(s) in the outbox for retry' : 'outbox full, event(s) dropped'}"
+        if (!queued) bumpOutboxDroppedCount()
+        return false
+    }
+
     if (enableDebugLogging) {
         log.debug "📤 POST to Core: ${coreIngestUrl()}"
         log.debug "📤 Body (${batch.size()} events):"
         batch.each { evt ->
-            log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, is_reachable: ${evt.is_reachable}, sequence=${evt.sequence_number}"
+            log.debug "   → device_id: ${evt.device_id}, event_type: ${evt.event_type}, equipment_status: ${evt.equipment_status}, is_reachable: ${evt.is_reachable}, sequence=${evt.sequence_number}, runtime=${evt.runtime_seconds}"
         }
     }
 
     Map result = _doCorePost(batch, false)
 
     if (result.kind == "ok") {
+        removeFromOutbox(batch)
         log.info "✅ Core POST OK (${result.status}) — ${batch.size()} event(s)"
         try {
             if (result.data?.gaps) {
@@ -1195,14 +1575,15 @@ private boolean _postToCoreWithJwt(Object body) {
     }
 
     if (result.kind == "permanent") {
+        removeFromOutbox(batch)
         log.error "❌ Core permanent error (${result.reason}) — dropping ${batch.size()} event(s): ${result.error}"
         bumpOutboxDroppedCount()
         return false
     }
 
-    // Transient: enqueue for retry.
-    log.warn "⚠️ Core transient error (${result.reason}) — enqueueing ${batch.size()} event(s) to outbox"
-    enqueueOutbox(batch, (result.reason as String) ?: "transient")
+    // Transient: already in the outbox, retried by drainOutbox.
+    log.warn "⚠️ Core transient error (${result.reason}) — ${queued ? 'left ' + batch.size() + ' event(s) in the outbox for retry' : 'outbox full, event(s) dropped'}"
+    if (!queued) bumpOutboxDroppedCount()
     return false
 }
 
@@ -1256,7 +1637,9 @@ private Map _doCorePost(List batch, boolean isRetry) {
             if (_issueCoreTokenOrLog()) {
                 return _doCorePost(batch, true)
             }
-            return [kind: "permanent", reason: "401_refresh_failed", error: "status=401"]
+            // Couldn't get a new token (Bubble down, network): the payload
+            // isn't wrong, so keep it for retry instead of dropping it.
+            return [kind: "transient", reason: "401_refresh_failed", error: "status=401"]
         }
         // Other non-2xx that somehow didn't throw. Treat as transient so
         // the outbox retries — if it's actually a permanent client
@@ -1286,7 +1669,7 @@ private Map _doCorePost(List batch, boolean isRetry) {
             if (_issueCoreTokenOrLog()) {
                 return _doCorePost(batch, true)
             }
-            return [kind: "permanent", reason: "401_refresh_failed", error: errMsg]
+            return [kind: "transient", reason: "401_refresh_failed", error: errMsg]
         }
 
         if (is4xx) {
@@ -1983,13 +2366,17 @@ private void resendBufferedEvents(List events) {
 
 /* ============================== OUTBOX (RELIABLE DELIVERY) ============================== */
 
-// Bounded retry queue for batches that failed the fresh POST.
+// Bounded outbound log + retry queue. Every fresh batch is written here
+// BEFORE its POST and removed when Core answers (ok or a permanent
+// rejection); what stays is what Core hasn't acknowledged.
 //
 // Works in tandem with state.eventBuffer:
 //   - eventBuffer handles "Core landed it but reports a gap later"
 //     via handleGapResponse / resendBufferedEvents.
 //   - outbox handles "the POST never landed" — network errors,
-//     timeouts, and 5xx from Core.
+//     timeouts, 5xx from Core, no core_token, and the hub dying or
+//     rebooting mid-send (atomicState is written immediately; plain
+//     state only when the handler returns).
 //
 // Entries are full batches (List<Map>) as _doCorePost accepts. Drain
 // calls _doCorePost directly and inherits its JWT-refresh path for
@@ -2002,32 +2389,37 @@ private void resendBufferedEvents(List events) {
 @Field static final List    OUTBOX_BACKOFF_SECS   = [30, 60, 120, 300, 600, 1800]
 
 /**
- * Add a failed batch to the outbox.
+ * Add a batch to the outbox.
  *
- * Called from _postToCoreWithJwt when _doCorePost returns a
- * transient result. The event(s) in `batch` are already in
- * state.eventBuffer from _postToCoreWithJwt's addToEventBuffer
- * call, so the gap-backfill path will still work even if this
- * batch eventually hits the attempt cap and gets dropped.
+ * Called from _postToCoreWithJwt BEFORE the POST (reason "in_flight";
+ * removed again by removeFromOutbox when Core answers), and from
+ * resendBufferedEvents after a transient failure. The first retry is
+ * OUTBOX_BACKOFF_SECS[0] later, so the drain doesn't race the fresh
+ * attempt. The event(s) in `batch` are already in state.eventBuffer, so
+ * the gap-backfill path still works even if this batch eventually hits
+ * the attempt cap and gets dropped.
  *
  * Drop-newest overflow policy: sequence_number advances at reserve
  * time, not at POST success. Dropping an older queued entry would
  * leave a used-but-never-sent sequence number that Core's gap
  * detector would chase forever. Dropping the newest keeps the
  * sequence stream's tail contiguous and deterministic: "we stopped
- * at sequence N, everything ≥ N+k is lost."
+ * at sequence N, everything ≥ N+k is lost." A fresh batch that finds
+ * the outbox full is still POSTed; it is only lost (and counted) if
+ * that POST fails.
  *
  * Note: the read-modify-write on atomicState.outbox here is not
- * truly atomic. Two concurrent failures can lose one enqueue. In
- * practice failures are rare enough that this is acceptable;
+ * truly atomic. Two concurrent writers can lose one enqueue. In
+ * practice that needs a write racing a drain during an outage;
  * flagged in comments so the next reader doesn't assume otherwise.
  */
 private Boolean enqueueOutbox(List batch, String reason) {
     List outbox = (atomicState.outbox ?: []) as List
+    boolean fresh = (reason == "in_flight")
 
     if (outbox.size() >= OUTBOX_MAX_ENTRIES) {
-        log.warn "⚠️ [outbox] Full (${outbox.size()}/${OUTBOX_MAX_ENTRIES}), dropping incoming batch (reason=${reason}, events=${batch.size()})"
-        bumpOutboxDroppedCount()
+        log.warn "⚠️ [outbox] Full (${outbox.size()}/${OUTBOX_MAX_ENTRIES}), ${fresh ? 'posting without a retry copy' : 'dropping incoming batch'} (reason=${reason}, events=${batch.size()})"
+        if (!fresh) bumpOutboxDroppedCount()
         return false
     }
 
@@ -2041,8 +2433,23 @@ private Boolean enqueueOutbox(List batch, String reason) {
     ]
     atomicState.outbox = outbox
 
-    log.warn "📤 [outbox] Enqueued batch (reason=${reason}, events=${batch.size()}, depth=${outbox.size()})"
+    if (fresh) logDebug "📤 [outbox] Recorded batch before POST (events=${batch.size()}, depth=${outbox.size()})"
+    else log.warn "📤 [outbox] Enqueued batch (reason=${reason}, events=${batch.size()}, depth=${outbox.size()})"
     return true
+}
+
+/**
+ * Remove the outbox entry holding exactly this batch (matched by its
+ * events' sequence numbers) once Core has answered it.
+ */
+private void removeFromOutbox(List batch) {
+    Set seqs = batch.collect { ((it as Map).sequence_number) as Long } as Set
+    List outbox = (atomicState.outbox ?: []) as List
+    List kept = outbox.findAll { entry ->
+        Set entrySeqs = (((entry as Map).body ?: []) as List).collect { ((it as Map).sequence_number) as Long } as Set
+        entrySeqs != seqs
+    }
+    if (kept.size() != outbox.size()) atomicState.outbox = kept
 }
 
 /**
