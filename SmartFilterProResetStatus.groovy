@@ -3,7 +3,7 @@ import groovy.transform.Field
 // Must equal "version" in packageManifest.json (scripts/check_manifest.py
 // enforces it). Recorded on the device as the "driverVersion" data value so
 // a hub's installed driver build can be identified.
-@Field static final String DRIVER_VERSION = "1.0.8"
+@Field static final String DRIVER_VERSION = "1.0.9"
 
 metadata {
     definition(name: "SmartFilterPro Status Sensor", namespace: "smartfilterpro", author: "Eric Hanfman",
