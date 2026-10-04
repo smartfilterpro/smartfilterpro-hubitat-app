@@ -1,7 +1,8 @@
 # Runs on every push and pull request: the manifest, the app and the two
 # drivers must agree on the version, every code location must be pinned to
 # the release tag for that version, and every beta location must track dev.
-# See scripts/check_manifest.py for the full list.
+# See scripts/check_manifest.py for the full list. The app's tests
+# (tests/run_tests.sh) run the real app source through a Hubitat stand-in.
 name: Validate
 
 on:
@@ -20,3 +21,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/check_manifest.py
+
+  app-tests:
+    name: app tests (runtime checkpoints)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: tests/run_tests.sh
