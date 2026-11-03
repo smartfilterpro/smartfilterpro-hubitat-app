@@ -32,11 +32,14 @@ import groovy.transform.Field
 // APP_VERSION must equal "version" in packageManifest.json (and
 // DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
 // CI; the release workflow tags main as v<version> once they agree.
-@Field static final String  APP_VERSION = "1.0.9"
+@Field static final String  APP_VERSION = "1.0.10"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
 @Field static final Integer TOKEN_SKEW_SECONDS = 60
+// While Bubble rejects the hub's sign-in, retry at most this often instead
+// of on every queued event (each attempt is two Bubble calls).
+@Field static final Long AUTH_RETRY_INTERVAL_MS = 15L * 60L * 1000L
 
 // Dedup window for Mode_Change events. Multiple overlapping thermostat
 // attribute subscriptions (thermostatOperatingState, thermostatFanMode, etc.)
@@ -115,7 +118,15 @@ def mainPage() {
         }
 
         section("Account Link") {
-            if (state.sfpAccessToken && state.sfpUserId) {
+            if (state.sfpAccessToken && state.sfpUserId && state.sfpAuthBrokenSince) {
+                // Tokens are stored but SmartFilterPro no longer accepts
+                // them: "Linked" here would hide that nothing is arriving.
+                String hvName = state.sfpHvacName ?: "(not selected)"
+                String since = new Date(state.sfpAuthBrokenSince as Long).format("MMM d, h:mm a", location?.timeZone ?: TimeZone.getDefault())
+                paragraph "<b>⚠️ Sign-in expired</b> — SmartFilterPro has rejected this hub's sign-in since ${since}, so runtime for ${hvName} is not being recorded. Sign in again below; queued events are sent as soon as it works."
+                href "linkPage", title: "Sign In Again",
+                     description: "Enter your SmartFilterPro email and password"
+            } else if (state.sfpAccessToken && state.sfpUserId) {
                 String hvName = state.sfpHvacName ?: "(not selected)"
                 paragraph "Linked ✅ Thermostat: ${hvName}"
                 href "linkPage", title: "Re-link / Switch HVAC",
@@ -146,7 +157,7 @@ def mainPage() {
 
         section("Update Notifications") {
             input "updateNotifyDevices", "capability.notification",
-                 title: "Notify these devices when an app update is available",
+                 title: "Notify these devices when an app update is available or the hub's sign-in expires",
                  description: "e.g. Hubitat mobile app, Pushover, SMS",
                  multiple: true, required: false
         }
@@ -483,6 +494,7 @@ def cloudLogin() {
         state.sfpUserId       = body.user_id
         state.sfpCoreToken    = body.core_token
         state.sfpCoreTokenExp = _normalizeEpochSeconds(body.expires_at)
+        _clearAuthBroken("signed in")
 
         // HVAC map - handle both single and multiple thermostats
         Map choices = [:]
@@ -1722,6 +1734,18 @@ private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
         return false
     }
 
+    // Bubble already refused this hub's sign-in: don't ask again on every
+    // queued event, only every AUTH_RETRY_INTERVAL_MS (it still recovers on
+    // its own if the problem was on Bubble's side). Signing in again clears it.
+    if (!isRetry && state.sfpAuthBrokenSince) {
+        Long last = (state.sfpAuthLastAttemptMs ?: 0L) as Long
+        if (now() - last < AUTH_RETRY_INTERVAL_MS) {
+            if (enableDebugLogging) log.debug "⏸️ Sign-in expired; next token attempt in ${((AUTH_RETRY_INTERVAL_MS - (now() - last)) / 60000L) as Long} min"
+            return false
+        }
+    }
+    state.sfpAuthLastAttemptMs = now()
+
     try {
         log.info "🔄 Requesting new core_token from Bubble..."
 
@@ -1743,6 +1767,7 @@ private boolean _issueCoreTokenOrLog(boolean isRetry = false) {
         if (core) {
             state.sfpCoreToken = core
             state.sfpCoreTokenExp = exp
+            _clearAuthBroken("core token issued")
             log.info "✅ Core token refreshed (exp: ${exp})"
             return true
         }
@@ -1793,6 +1818,7 @@ private boolean _refreshBubbleAccessToken() {
     String rt = (state.sfpRefreshToken ?: "")
     if (!rt) {
         log.warn "❌ Cannot refresh — no Bubble refresh_token stored (re-link required)"
+        _markAuthBroken("no refresh token stored")
         return false
     }
 
@@ -1812,6 +1838,9 @@ private boolean _refreshBubbleAccessToken() {
         String newAccess = (body?.access_token ?: body?.token ?: "").toString()
         if (!newAccess) {
             log.error "❌ Refresh response missing access_token: ${body}"
+            // Bubble answered and said no (soft 401 / invalid_token): the
+            // refresh token is dead and only signing in again fixes it.
+            if (_bubbleResult(body).authError) _markAuthBroken("refresh token rejected")
             return false
         }
 
@@ -1826,9 +1855,35 @@ private boolean _refreshBubbleAccessToken() {
         log.info "✅ Bubble access_token refreshed"
         return true
     } catch (Exception e) {
+        String lower = e.toString().toLowerCase()
+        if (lower.contains("401") || lower.contains("invalid_token") || lower.contains("unauthorized")) {
+            _markAuthBroken("refresh token rejected")
+        }
         log.error "❌ Failed to refresh Bubble access_token: ${e.message} (re-link may be required)"
         return false
     }
+}
+
+/**
+ * Bubble refused the hub's sign-in (refresh token rejected or missing).
+ * Recorded so the app page stops saying "Linked" and token attempts back
+ * off; on the first failure, the user's notification devices are told.
+ * A network error is NOT a reason: only an answer from Bubble saying no.
+ */
+private void _markAuthBroken(String reason) {
+    if (state.sfpAuthBrokenSince) return
+    state.sfpAuthBrokenSince = now()
+    state.sfpAuthBrokenReason = reason
+    log.error "🔒 SmartFilterPro sign-in expired (${reason}). Runtime is queued but not delivered until you sign in again from the app page."
+    _notifyUser("SmartFilterPro: this hub's sign-in has expired, so runtime is not being recorded. Open the SmartFilterPro app on your hub and choose Sign In Again.")
+}
+
+private void _clearAuthBroken(String why) {
+    if (!state.sfpAuthBrokenSince) return
+    state.remove("sfpAuthBrokenSince")
+    state.remove("sfpAuthBrokenReason")
+    state.remove("sfpAuthLastAttemptMs")
+    log.info "🔓 SmartFilterPro sign-in working again (${why})"
 }
 
 /* ============================== BUBBLE STATUS POLLING ============================== */
@@ -1946,19 +2001,22 @@ def checkForUpdate() {
  * No-op when the user hasn't picked any notification devices.
  */
 private void sendUpdateNotification(String latestVersion) {
+    _notifyUser("SmartFilterPro: version ${latestVersion} is available (you have ${APP_VERSION}). Update via Hubitat Package Manager.")
+}
+
+/** Push a message through the user-selected notification device(s); no-op when none are picked. */
+private void _notifyUser(String msg) {
     def devices = settings.updateNotifyDevices
     if (!devices) {
-        logDebug "No update-notification devices configured; skipping push"
+        if (enableDebugLogging) log.debug "No notification devices configured; skipping push"
         return
     }
-
-    String msg = "SmartFilterPro: version ${latestVersion} is available (you have ${APP_VERSION}). Update via Hubitat Package Manager."
     devices.each { d ->
         try {
             d.deviceNotification(msg)
-            log.info "🔔 Sent update notification to ${d.displayName}"
+            log.info "🔔 Sent notification to ${d.displayName}"
         } catch (Exception e) {
-            log.warn "Could not send update notification to ${d?.displayName}: ${e.message}"
+            log.warn "Could not send notification to ${d?.displayName}: ${e.message}"
         }
     }
 }
