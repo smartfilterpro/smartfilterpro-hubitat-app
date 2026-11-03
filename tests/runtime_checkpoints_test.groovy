@@ -325,6 +325,47 @@ test("no core_token: runtime is kept in the outbox and delivered once a token is
     check(((h.atomicState.outbox ?: []) as List).isEmpty(), "outbox drained")
 }
 
+test("Bubble refusing the sign-in: flagged once, one notification, backs off, recovers on its own") {
+    def h = harness()
+    h.install(t("2026-10-04 23:07:00"))
+    def phone = [displayName: "Phone", deviceNotification: { String m -> h.notifications << m }] as Expando
+    h.settings.updateNotifyDevices = [phone]
+    h.bubbleRejectsAuth = true
+    h.advanceTo(t("2026-10-04 23:50:00"))
+    // Core stops accepting the hub's token (e.g. its signing secret rotated)
+    h.stateStore.sfpCoreToken = "core-token-rotated-away"
+    h.advanceTo(t("2026-10-05 00:00:00"))
+    h.deviceEvent("thermostatFanMode", "on")
+    h.advanceTo(t("2026-10-05 01:00:00"))
+
+    check(h.totalSeconds("fan") == 0L && !h.core.any { it.equipment_status == "Fan_only" }, "nothing delivered while the sign-in is refused")
+    check(h.stateStore.sfpAuthBrokenSince != null, "sign-in marked as expired (the page stops saying Linked)")
+    check(h.notifications.size() == 1, "exactly one notification, got ${h.notifications.size()}: ${h.notifications}")
+    // About an hour of queued events and checkpoints, but at most one token
+    // attempt per 15 minutes once the failure is known (plus the first).
+    check(h.refreshCalls <= 6, "refresh attempts back off: ${h.refreshCalls} in an hour")
+
+    h.bubbleRejectsAuth = false
+    h.advanceTo(t("2026-10-05 01:30:00"))
+    h.deviceEvent("thermostatFanMode", "auto")
+    h.advanceTo(t("2026-10-05 03:00:00"))
+
+    check(h.stateStore.sfpAuthBrokenSince == null, "recovered without signing in again once Bubble accepts")
+    check(h.totalSeconds("fan") == 5400L, "queued fan runtime delivered: ${h.totalSeconds('fan')} s, expected 5400 (${summary(h)})")
+    check(h.notifications.size() == 1, "no second notification")
+}
+
+test("a network failure is not mistaken for an expired sign-in") {
+    def h = harness()
+    h.install(t("2026-10-04 23:07:00"))
+    h.stateStore.sfpCoreTokenExp = (long) (t("2026-10-04 23:30:00") / 1000L)
+    h.bubbleUp = false
+    h.advanceTo(t("2026-10-05 00:00:00"))
+    h.deviceEvent("thermostatFanMode", "on")
+    h.advanceTo(t("2026-10-05 00:30:00"))
+    check(h.stateStore.sfpAuthBrokenSince == null, "Bubble unreachable is not 'sign-in expired'")
+}
+
 test("the hub dying mid-POST doesn't lose the runtime in it") {
     def h = harness()
     h.install(t("2026-10-04 23:07:00"))

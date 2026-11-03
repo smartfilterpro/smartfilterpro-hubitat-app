@@ -51,6 +51,12 @@ class HubitatHarness {
     Closure coreFailure = null  // { List batch -> null | "transient" | "crash" }
     boolean bubbleUp = true
     int tokenIssues = 0
+    // Bubble refuses the hub's sign-in: issue_core_token_hub and
+    // hubitat_refresh_token both answer with a soft 401 (HTTP 200, the real
+    // status in the body), as live Bubble does for a dead refresh token.
+    boolean bubbleRejectsAuth = false
+    int refreshCalls = 0
+    List notifications = []
 
     HubitatHarness(String appPath) {
         binding = new Binding()
@@ -198,9 +204,18 @@ class HubitatHarness {
             callback.call([status: 200, data: [ok: true, inserted: []]])
             return
         }
-        if (uri.endsWith("/issue_core_token_hub")) {
+        if (uri.endsWith("/issue_core_token_hub") || uri.endsWith("/hubitat_refresh_token")) {
             if (!bubbleUp) throw new IOException("Bubble unavailable")
-            tokenIssues++
+            boolean refresh = uri.endsWith("/hubitat_refresh_token")
+            if (refresh) refreshCalls++ else tokenIssues++
+            if (bubbleRejectsAuth) {
+                callback.call([status: 200, data: [response: [Body: '{ "error": "invalid_token", "message": "Access token expired or invalid" }', status: 401]]])
+                return
+            }
+            if (refresh) {
+                callback.call([status: 200, data: [response: [access_token: "access-token-new", refresh_token: "refresh-token-new"]]])
+                return
+            }
             callback.call([status: 200, data: [response: [core_token: CORE_TOKEN, expires_at: (long) (clock / 1000L) + 86400L]]])
             return
         }
