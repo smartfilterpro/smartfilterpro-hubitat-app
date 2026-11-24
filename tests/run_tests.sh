@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run the app's tests off the hub: tests/runtime_checkpoints_test.groovy
-# loads SmartFilterProHubitatApp.groovy through tests/HubitatHarness.groovy.
+# Run the app's tests off the hub: tests/runtime_checkpoints_test.groovy and
+# tests/sign_in_test.groovy load SmartFilterProHubitatApp.groovy through
+# tests/HubitatHarness.groovy.
 #
 # Needs Java (11+). Downloads groovy-all 2.4.21 (Hubitat runs Groovy 2.4)
 # from Maven Central into tests/.cache on first use, or uses GROOVY_JAR.
@@ -19,4 +20,8 @@ fi
 
 app="${1:-$root/SmartFilterProHubitatApp.groovy}"
 cd "$root"
-exec java -cp "$jar:$here" groovy.ui.GroovyMain "$here/runtime_checkpoints_test.groovy" "$app"
+status=0
+for t in runtime_checkpoints_test sign_in_test; do
+  java -cp "$jar:$here" groovy.ui.GroovyMain "$here/$t.groovy" "$app" || status=1
+done
+exit $status
