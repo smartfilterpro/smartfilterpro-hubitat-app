@@ -69,7 +69,7 @@ Hubitat Package Manager does this for you. For a manual install, open the app un
 
 The sign-in link is good for 15 minutes; if it expires, tap the button again.
 
-**Email and password (older accounts):** *Use email and password instead* still works for accounts that have a SmartFilterPro password. Accounts created with Apple or Google don't have one, so use the button above.
+The hub never sees your password: you sign in on smartfilterpro.com, and SmartFilterPro gives the hub its own sign-in. (The old email and password fields were removed in version 1.0.12; hubs linked that way keep working.)
 
 Other options:
 - **Use Test Environment**: testers only (see above)

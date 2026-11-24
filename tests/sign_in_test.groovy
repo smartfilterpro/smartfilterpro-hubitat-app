@@ -185,22 +185,16 @@ test("cancelling on smartfilterpro.com is reported, not treated as an error to r
     check(h.rendered.last().data.contains("cancelled"), "${h.rendered.last().data}")
 }
 
-test("the email + password sign-in still works and reads expires_at as the Core token expiry") {
+test("the email + password sign-in is gone, and a saved email or password is removed") {
     def h = harness()
-    h.clock = t("2026-11-24 10:00:00")
+    check(!h.app.metaClass.respondsTo(h.app, "cloudLogin"), "no cloudLogin handler (the /login endpoint is gone)")
+    check(!new File(appPath).text.contains("hubitat_password"), "the app never calls the password workflow")
+    h.install(t("2026-11-24 09:00:00"))
     h.settings.loginEmail = "someone@example.com"
-    h.settings.loginPassword = "pw"
-    h.hubTokenAnswer = null
-    def orig = h.&httpPost
-    h.metaClass.httpPost = { Map params, Closure cb ->
-        if ((params.uri as String).endsWith("/hubitat_password")) {
-            cb.call([status: 200, data: [response: [access_token: "a", refresh_token: "r", user_id: "u", core_token: "c", expires_at: 1795000123, hvac_id: "hv-1", hvac_name: "Hall"]]])
-        } else orig.call(params, cb)
-    }
-    h.web("cloudLogin", [:])
-    check(h.stateStore.sfpAccessToken == "a" && h.stateStore.sfpCoreTokenExp == 1795000123L, "stored")
-    check(h.stateStore.sfpHvacId == "hv-1", "single thermostat selected")
-    check(!h.settings.containsKey("loginPassword"), "password removed")
+    h.settings.loginPassword = "left-from-a-failed-sign-in"
+    h.exec { h.app.updated() }
+    check(!h.settings.containsKey("loginEmail") && !h.settings.containsKey("loginPassword"), "settings removed on Done: ${h.settings.keySet()}")
+    check(h.stateStore.sfpAccessToken == "access-token-test", "an existing link is kept")
 }
 
 println "\n${passed} passed, ${failures.size()} failed"
