@@ -58,6 +58,13 @@ class HubitatHarness {
     int refreshCalls = 0
     List notifications = []
 
+    // Sign in with SmartFilterPro: what the hub sent to hub_token, and what
+    // hub_token answers ({ Map request -> Map body }, wrapped like Bubble).
+    List hubTokenRequests = []
+    Closure hubTokenAnswer = null
+    // Pages the app rendered from its web endpoints (render(...)).
+    List rendered = []
+
     HubitatHarness(String appPath) {
         binding = new Binding()
         binding.setVariable("__harness", this)
@@ -65,7 +72,8 @@ class HubitatHarness {
         binding.setVariable("atomicState", atomicState)
         binding.setVariable("log", log)
         binding.setVariable("location", [timeZone: TimeZone.getTimeZone(TZ), hubs: [[id: "hub-1"]]])
-        binding.setVariable("app", [id: 7, label: "SmartFilterPro"])
+        binding.setVariable("app", new Expando(id: 7, label: "SmartFilterPro", removeSetting: { String n -> settings.remove(n) }))
+        binding.setVariable("params", [:])
         binding.setVariable("state", stateStore)
         def config = new CompilerConfiguration()
         config.scriptBaseClass = HubitatAppScript.name
@@ -219,7 +227,20 @@ class HubitatHarness {
             callback.call([status: 200, data: [response: [core_token: CORE_TOKEN, expires_at: (long) (clock / 1000L) + 86400L]]])
             return
         }
+        if (uri.endsWith("/hub_token")) {
+            Map req = AtomicStore.jsonCopy(params.body) as Map
+            hubTokenRequests << [uri: uri, body: req]
+            if (!hubTokenAnswer) throw new IOException("hub_token called without an answer set")
+            callback.call([status: 200, data: [status: "success", response: hubTokenAnswer.call(req)]])
+            return
+        }
         throw new IOException("unexpected POST in test: ${uri}")
+    }
+
+    /** Call one of the app's web endpoints with these query parameters. */
+    void web(String handler, Map query) {
+        binding.setVariable("params", query)
+        try { exec { app."${handler}"() } } finally { binding.setVariable("params", [:]) }
     }
 
     // ------------------------------------------------------- Core runtime
@@ -289,6 +310,11 @@ abstract class HubitatAppScript extends Script {
     def getChildDevice(String dni) { null }
     void deleteChildDevice(String dni) {}
     String getHubUID() { "hub-1" }
+    String getApiServerUrl() { "https://cloud.hubitat.com" }
+    void createAccessToken() { binding.getVariable("state").accessToken = "app-token-1" }
+    def render(Map m) { h.rendered << m; return m }
+    // Page DSL (only reached when a test renders a page)
+    void href(Map m) { h.rendered << [href: m] }
 }
 
 /** atomicState: immediate writes; reads and writes are JSON copies. */
