@@ -32,14 +32,16 @@ import groovy.transform.Field
 // APP_VERSION must equal "version" in packageManifest.json (and
 // DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
 // CI; the release workflow tags main as v<version> once they agree.
-@Field static final String  APP_VERSION = "1.0.11"
+@Field static final String  APP_VERSION = "1.0.12"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 // "Sign in with SmartFilterPro" (OAuth authorization code + PKCE). The hub
 // opens SmartFilterPro's hub_connect page, where the user signs in however
 // they signed up (Apple, Google or email); SmartFilterPro sends the browser
 // back with a one-time code, and the hub swaps it at the hub_token workflow
-// for the same tokens the email + password sign-in returns.
+// for this hub's tokens. It is the only way to link a hub: the old email +
+// password sign-in was removed in 1.0.12 (Apple and Google accounts have no
+// password, and the hub should never hold one).
 //
 // The redirect goes through Hubitat's cloud: a fixed redirect_uri, with the
 // route back to this app in `state` (Hubitat's documented OAuth pattern).
@@ -143,8 +145,7 @@ def mainPage() {
                 String since = new Date(state.sfpAuthBrokenSince as Long).format("MMM d, h:mm a", location?.timeZone ?: TimeZone.getDefault())
                 paragraph "<b>⚠️ Sign-in expired</b> — SmartFilterPro has rejected this hub's sign-in since ${since}, so runtime for ${hvName} is not being recorded. Sign in again below; queued events are sent as soon as it works."
                 _signInHref("Sign In Again")
-                href "linkPage", title: "Use email and password instead",
-                     description: "For accounts with a SmartFilterPro password"
+                if (state.lastLoginError) paragraph "Last attempt: ${state.lastLoginError}"
             } else if (state.sfpAccessToken && state.sfpUserId) {
                 String hvName = state.sfpHvacName ?: "(not selected)"
                 paragraph "Linked ✅ Thermostat: ${hvName}"
@@ -158,8 +159,6 @@ def mainPage() {
                 paragraph "Sign in with the account you use in the SmartFilterPro app. Apple, Google and email sign-ins all work."
                 _signInHref("Sign in with SmartFilterPro")
                 if (state.lastLoginError) paragraph "Last attempt: ${state.lastLoginError}"
-                href "linkPage", title: "Use email and password instead",
-                     description: "For accounts with a SmartFilterPro password"
             }
         }
 
@@ -217,19 +216,8 @@ def mainPage() {
 def linkPage() {
     dynamicPage(name: "linkPage", title: "Link SmartFilterPro", install: false, uninstall: false) {
         section("Sign In") {
-            paragraph "Works with Apple, Google and email sign-ins."
+            paragraph "Sign in with the account you use in the SmartFilterPro app. Apple, Google and email sign-ins all work."
             _signInHref("Sign in with SmartFilterPro")
-        }
-
-        // Kept for existing setups during the move to the sign-in page above.
-        // Accounts created with Apple or Google have no password, so they
-        // can only use the button above.
-        section("Or sign in with email and password") {
-            input "loginEmail", "email", title: "Email", required: false, submitOnChange: true
-            input "loginPassword", "password", title: "Password", required: false, submitOnChange: true
-            href name: "doLogin", title: "Authenticate", style: "external",
-                 description: "Tap to log in (opens new tab)",
-                 url: "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
         }
 
         if (state.lastLoginError) {
@@ -330,7 +318,6 @@ def statusPage() {
 /* ============================== MAPPINGS ============================== */
 
 mappings {
-    path("/login")      { action: [ GET: "cloudLogin" ] }
     path("/oauth/callback") { action: [ GET: "oauthCallback" ] }
     path("/chooseHvac") { action: [ GET: "cloudChooseHvac" ] }
 }
@@ -505,32 +492,6 @@ def debugOnlineStatus() {
 
 /* ============================== LOGIN / HVAC ============================== */
 
-def cloudLogin() {
-    try {
-        def email = settings.loginEmail?.trim()
-        def pwd = settings.loginPassword
-        if (!email || !pwd) return _html("Missing credentials.")
-
-        Map loginResp
-        httpPost([
-            uri: bubbleUrl("hubitat_password"),
-            contentType: "application/json",
-            body: [ email: email, password: pwd ],
-            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
-        ]) { resp -> loginResp = resp.data }
-
-        Map body = _bubbleBody(loginResp)
-        if (!body.access_token) return _html("Login failed.")
-
-        _applySignIn(body, "email and password")
-        _html("Login complete. Close this tab and return to the app.")
-    } catch (e) {
-        log.error "Login error: ${e}"
-        state.lastLoginError = e.toString()
-        _html("Login failed: ${e}")
-    }
-}
-
 def cloudChooseHvac() {
     def id = params?.id?.toString()
     if (id) {
@@ -648,10 +609,9 @@ def oauthCallback() {
 }
 
 /**
- * Store what a sign-in returned. Both sign-ins (hub_token and the email +
- * password workflow) return the same fields; the Core token's expiry is
- * core_token_expires_at from hub_token and expires_at from the password
- * workflow.
+ * Store what hub_token returned. The Core token's expiry is
+ * core_token_expires_at (expires_at is still read in case an older Bubble
+ * workflow answers).
  */
 private void _applySignIn(Map body, String how) {
     state.sfpAccessToken  = body.access_token
@@ -688,9 +648,20 @@ private void _applySignIn(Map body, String how) {
         log.info "📋 Multiple HVACs found: ${choices.size()}"
     }
 
-    app.removeSetting("loginPassword")
+    _forgetPasswordSettings()
     state.lastLoginError = null
     log.info "Signed in to SmartFilterPro (${how})"
+}
+
+/**
+ * The email and password the old sign-in kept in the app's settings. The
+ * password was removed after each sign-in, but an email (and a password from
+ * a sign-in that failed) could remain.
+ */
+private void _forgetPasswordSettings() {
+    ["loginEmail", "loginPassword"].each { String n ->
+        if (settings?.get(n) != null) app.removeSetting(n)
+    }
 }
 
 /** Signed in with several thermostats and none chosen yet. */
@@ -764,6 +735,7 @@ def installed() {
 
 def updated()  {
     log.info "SmartFilterPro Bridge updated"
+    _forgetPasswordSettings()
     // Per-device sequence counter (atomicState.lastSequenceByDevice) is
     // lazily bootstrapped + legacy-migrated by reserveSequenceNumber()
     // on first use. We deliberately DO NOT touch it here — resetting
