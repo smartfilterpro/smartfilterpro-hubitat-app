@@ -32,8 +32,26 @@ import groovy.transform.Field
 // APP_VERSION must equal "version" in packageManifest.json (and
 // DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
 // CI; the release workflow tags main as v<version> once they agree.
-@Field static final String  APP_VERSION = "1.0.10"
+@Field static final String  APP_VERSION = "1.0.11"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
+
+// "Sign in with SmartFilterPro" (OAuth authorization code + PKCE). The hub
+// opens SmartFilterPro's hub_connect page, where the user signs in however
+// they signed up (Apple, Google or email); SmartFilterPro sends the browser
+// back with a one-time code, and the hub swaps it at the hub_token workflow
+// for the same tokens the email + password sign-in returns.
+//
+// The redirect goes through Hubitat's cloud: a fixed redirect_uri, with the
+// route back to this app in `state` (Hubitat's documented OAuth pattern).
+// SmartFilterPro returns `state` untouched, so its allowlist only needs the
+// one fixed address. PKCE binds the code to this hub: it is useless without
+// the verifier, which never leaves the hub until the swap.
+@Field static final String HUB_CONNECT_URL_LIVE = "https://smartfilterpro.com/hub_connect"
+@Field static final String HUB_CONNECT_URL_TEST = "https://smartfilterpro.com/version-test/hub_connect"
+@Field static final String OAUTH_CLIENT_ID = "hubitat"
+@Field static final String OAUTH_REDIRECT_URI = "https://cloud.hubitat.com/oauth/stateredirect"
+// A sign-in started from the app page must finish within this long.
+@Field static final Long OAUTH_PENDING_TTL_MS = 15L * 60L * 1000L
 
 @Field static final Integer DEFAULT_HTTP_TIMEOUT = 30
 @Field static final Integer TOKEN_SKEW_SECONDS = 60
@@ -124,18 +142,24 @@ def mainPage() {
                 String hvName = state.sfpHvacName ?: "(not selected)"
                 String since = new Date(state.sfpAuthBrokenSince as Long).format("MMM d, h:mm a", location?.timeZone ?: TimeZone.getDefault())
                 paragraph "<b>⚠️ Sign-in expired</b> — SmartFilterPro has rejected this hub's sign-in since ${since}, so runtime for ${hvName} is not being recorded. Sign in again below; queued events are sent as soon as it works."
-                href "linkPage", title: "Sign In Again",
-                     description: "Enter your SmartFilterPro email and password"
+                _signInHref("Sign In Again")
+                href "linkPage", title: "Use email and password instead",
+                     description: "For accounts with a SmartFilterPro password"
             } else if (state.sfpAccessToken && state.sfpUserId) {
                 String hvName = state.sfpHvacName ?: "(not selected)"
                 paragraph "Linked ✅ Thermostat: ${hvName}"
+                if (_needsHvacChoice()) {
+                    href "selectHvacPage", title: "Choose Thermostat",
+                         description: "Your account has ${(state.sfpHvacChoices as Map).size()} thermostats. Pick the one this hub controls."
+                }
                 href "linkPage", title: "Re-link / Switch HVAC",
-                     description: "Update account or choose a different HVAC"
+                     description: "Sign in again or choose a different HVAC"
             } else {
-                input "loginEmail",    "email",    title: "Email",    required: true
-                input "loginPassword", "password", title: "Password", required: true
-                href "linkPage", title: "Link Account",
-                     description: "Authenticate and select HVAC"
+                paragraph "Sign in with the account you use in the SmartFilterPro app. Apple, Google and email sign-ins all work."
+                _signInHref("Sign in with SmartFilterPro")
+                if (state.lastLoginError) paragraph "Last attempt: ${state.lastLoginError}"
+                href "linkPage", title: "Use email and password instead",
+                     description: "For accounts with a SmartFilterPro password"
             }
         }
 
@@ -193,8 +217,16 @@ def mainPage() {
 def linkPage() {
     dynamicPage(name: "linkPage", title: "Link SmartFilterPro", install: false, uninstall: false) {
         section("Sign In") {
-            input "loginEmail", "email", title: "Email", required: true, submitOnChange: true
-            input "loginPassword", "password", title: "Password", required: true, submitOnChange: true
+            paragraph "Works with Apple, Google and email sign-ins."
+            _signInHref("Sign in with SmartFilterPro")
+        }
+
+        // Kept for existing setups during the move to the sign-in page above.
+        // Accounts created with Apple or Google have no password, so they
+        // can only use the button above.
+        section("Or sign in with email and password") {
+            input "loginEmail", "email", title: "Email", required: false, submitOnChange: true
+            input "loginPassword", "password", title: "Password", required: false, submitOnChange: true
             href name: "doLogin", title: "Authenticate", style: "external",
                  description: "Tap to log in (opens new tab)",
                  url: "${appEndpointBase()}/login?access_token=${getOrCreateAppToken()}"
@@ -208,7 +240,7 @@ def linkPage() {
         try {
             def choices = state.sfpHvacChoices
             def hvacId = state.sfpHvacId
-            if (choices != null && hvacId == null && choices instanceof Map && choices.size() > 1) {
+            if (_needsHvacChoice()) {
                 section("Select Thermostat") {
                     href "selectHvacPage", title: "Select HVAC",
                          description: "Multiple thermostats found (${choices.size()}). Pick one."
@@ -299,6 +331,7 @@ def statusPage() {
 
 mappings {
     path("/login")      { action: [ GET: "cloudLogin" ] }
+    path("/oauth/callback") { action: [ GET: "oauthCallback" ] }
     path("/chooseHvac") { action: [ GET: "cloudChooseHvac" ] }
 }
 
@@ -489,36 +522,7 @@ def cloudLogin() {
         Map body = _bubbleBody(loginResp)
         if (!body.access_token) return _html("Login failed.")
 
-        state.sfpAccessToken  = body.access_token
-        state.sfpRefreshToken = body.refresh_token
-        state.sfpUserId       = body.user_id
-        state.sfpCoreToken    = body.core_token
-        state.sfpCoreTokenExp = _normalizeEpochSeconds(body.expires_at)
-        _clearAuthBroken("signed in")
-
-        // HVAC map - handle both single and multiple thermostats
-        Map choices = [:]
-        List ids = body.hvac_id instanceof List ? body.hvac_id : (body.hvac_id ? [body.hvac_id] : [])
-        List names = body.hvac_name instanceof List ? body.hvac_name : (body.hvac_name ? [body.hvac_name] : [])
-
-        ids.eachWithIndex { id, idx ->
-            if (id) {
-                // Safely get name, fall back to id if index out of bounds or null
-                String name = (idx < names.size() && names[idx]) ? names[idx].toString() : id.toString()
-                choices[id.toString()] = name
-            }
-        }
-        state.sfpHvacChoices = choices
-
-        if (choices.size() == 1) {
-            state.sfpHvacId = choices.keySet().first()
-            state.sfpHvacName = choices.values().first()
-        } else if (choices.size() > 1) {
-            log.info "📋 Multiple HVACs found: ${choices}"
-        }
-
-        app.removeSetting("loginPassword")
-        state.lastLoginError = null
+        _applySignIn(body, "email and password")
         _html("Login complete. Close this tab and return to the app.")
     } catch (e) {
         log.error "Login error: ${e}"
@@ -534,6 +538,165 @@ def cloudChooseHvac() {
         state.sfpHvacName = (state.sfpHvacChoices ?: [:])[state.sfpHvacId]
     }
     _html("Saved HVAC. Close this tab and return.")
+}
+
+/* ------------------------- Sign in with SmartFilterPro ------------------------- */
+
+/** External link that starts "Sign in with SmartFilterPro" in a browser tab. */
+private void _signInHref(String title) {
+    href name: "sfpSignIn", title: title, style: "external",
+         description: "Opens smartfilterpro.com in a new tab",
+         url: _oauthAuthorizeUrl()
+}
+
+/**
+ * The hub_connect address for this hub. The PKCE verifier behind it is kept
+ * in state until the sign-in finishes or OAUTH_PENDING_TTL_MS passes, so the
+ * page can re-render (every submitOnChange does) without invalidating a tab
+ * the user already opened.
+ */
+private String _oauthAuthorizeUrl() {
+    Map pending = _oauthPending()
+    String routeBack = "${hubUidSafe()}/apps/${app.id}/oauth/callback?access_token=${getOrCreateAppToken()}"
+    String base = settings?.useTestEnvironment ? HUB_CONNECT_URL_TEST : HUB_CONNECT_URL_LIVE
+    Map q = [
+        client               : OAUTH_CLIENT_ID,
+        redirect_uri         : OAUTH_REDIRECT_URI,
+        state                : routeBack,
+        code_challenge       : _pkceChallenge(pending.verifier as String),
+        code_challenge_method: "S256",
+    ]
+    return base + "?" + q.collect { k, v -> "${k}=${URLEncoder.encode(v.toString(), 'UTF-8')}" }.join("&")
+}
+
+/** The sign-in in progress, started fresh when there is none, it expired, or the environment changed. */
+private Map _oauthPending() {
+    Map p = state.sfpOauthPending as Map
+    boolean test = settings?.useTestEnvironment ? true : false
+    if (!p?.verifier || (now() - (p.createdAt as Long)) > OAUTH_PENDING_TTL_MS || (p.test as Boolean) != test) {
+        p = [verifier: _randomVerifier(), createdAt: now(), test: test]
+        state.sfpOauthPending = p
+    }
+    return p
+}
+
+/** 64 characters from two random UUIDs (SecureRandom): inside PKCE's 43-128 limit and alphabet. */
+private String _randomVerifier() {
+    return (UUID.randomUUID().toString() + UUID.randomUUID().toString()).replace("-", "")
+}
+
+/** PKCE S256: base64url(SHA-256(verifier)) with no padding. */
+private String _pkceChallenge(String verifier) {
+    byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(verifier.getBytes("UTF-8"))
+    return digest.encodeBase64().toString().replace('+', '-').replace('/', '_').replaceAll('=+$', '')
+}
+
+/**
+ * Hubitat's cloud forwards the browser here with SmartFilterPro's one-time
+ * code. Swap it at hub_token (with the verifier) for this hub's tokens.
+ * The code is single-use either way, so the pending sign-in is cleared
+ * after any attempt and the next tap of the button starts a new one.
+ */
+def oauthCallback() {
+    String code = params?.code?.toString()
+    Map pending = state.sfpOauthPending as Map
+    state.remove("sfpOauthPending")
+
+    if (params?.error) {
+        state.lastLoginError = "Sign-in was cancelled on smartfilterpro.com"
+        return _html("Sign-in was cancelled. Close this tab and tap Sign in with SmartFilterPro again.")
+    }
+    if (!code) {
+        state.lastLoginError = "Sign-in returned no code"
+        return _html("Sign-in didn't complete. Close this tab and try again.")
+    }
+    if (!pending?.verifier || (now() - (pending.createdAt as Long)) > OAUTH_PENDING_TTL_MS) {
+        state.lastLoginError = "Sign-in link expired"
+        return _html("That sign-in link has expired. Go back to the Hubitat app and tap Sign in with SmartFilterPro again.")
+    }
+
+    try {
+        Map tokenResp
+        httpPost([
+            uri: bubbleUrl("hub_token"),
+            contentType: "application/json",
+            body: [
+                code         : code,
+                code_verifier: pending.verifier,
+                redirect_uri : OAUTH_REDIRECT_URI,
+                client       : OAUTH_CLIENT_ID,
+            ],
+            timeout: (settings.httpTimeout ?: DEFAULT_HTTP_TIMEOUT)
+        ]) { resp -> tokenResp = resp.data as Map }
+
+        Map body = _bubbleBody(tokenResp)
+        if (!body?.access_token) {
+            // Never log the body: on success it holds tokens. The error is a short code.
+            log.warn "Sign in with SmartFilterPro: no tokens returned (${body?.error ?: 'no error given'})"
+            state.lastLoginError = "SmartFilterPro didn't accept the sign-in (${body?.error ?: 'no tokens'})"
+            return _html("SmartFilterPro didn't accept that sign-in. Close this tab and tap Sign in with SmartFilterPro again.")
+        }
+
+        _applySignIn(body, "Sign in with SmartFilterPro")
+        String next = _needsHvacChoice() ? " Then choose which thermostat this hub controls." : ""
+        _html("Signed in to SmartFilterPro. Close this tab and return to the Hubitat app.${next}")
+    } catch (e) {
+        log.error "Sign in with SmartFilterPro failed: ${e.class.simpleName}: ${e.message}"
+        state.lastLoginError = "Sign-in failed: ${e.class.simpleName}"
+        _html("Sign-in failed. Close this tab and try again in a minute.")
+    }
+}
+
+/**
+ * Store what a sign-in returned. Both sign-ins (hub_token and the email +
+ * password workflow) return the same fields; the Core token's expiry is
+ * core_token_expires_at from hub_token and expires_at from the password
+ * workflow.
+ */
+private void _applySignIn(Map body, String how) {
+    state.sfpAccessToken  = body.access_token
+    state.sfpRefreshToken = body.refresh_token
+    state.sfpUserId       = body.user_id
+    state.sfpCoreToken    = body.core_token
+    state.sfpCoreTokenExp = _normalizeEpochSeconds(body.core_token_expires_at ?: body.expires_at)
+    _clearAuthBroken("signed in (${how})")
+
+    // HVAC map - handle both single and multiple thermostats
+    Map choices = [:]
+    List ids = body.hvac_id instanceof List ? body.hvac_id : (body.hvac_id ? [body.hvac_id] : [])
+    List names = body.hvac_name instanceof List ? body.hvac_name : (body.hvac_name ? [body.hvac_name] : [])
+
+    ids.eachWithIndex { id, idx ->
+        if (id) {
+            // Safely get name, fall back to id if index out of bounds or null
+            String name = (idx < names.size() && names[idx]) ? names[idx].toString() : id.toString()
+            choices[id.toString()] = name
+        }
+    }
+    state.sfpHvacChoices = choices
+
+    // A thermostat chosen under an earlier sign-in that this account doesn't
+    // have would post runtime to the wrong (or someone else's) thermostat.
+    if (choices && state.sfpHvacId && !choices.containsKey(state.sfpHvacId.toString())) {
+        state.sfpHvacId = null
+        state.sfpHvacName = null
+    }
+    if (choices.size() == 1) {
+        state.sfpHvacId = choices.keySet().first()
+        state.sfpHvacName = choices.values().first()
+    } else if (choices.size() > 1) {
+        log.info "📋 Multiple HVACs found: ${choices.size()}"
+    }
+
+    app.removeSetting("loginPassword")
+    state.lastLoginError = null
+    log.info "Signed in to SmartFilterPro (${how})"
+}
+
+/** Signed in with several thermostats and none chosen yet. */
+private boolean _needsHvacChoice() {
+    def choices = state.sfpHvacChoices
+    return choices instanceof Map && choices.size() > 1 && state.sfpHvacId == null
 }
 
 private def _html(String msg) {

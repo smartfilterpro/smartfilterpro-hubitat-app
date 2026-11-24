@@ -54,26 +54,31 @@ Do the same under `Drivers Code` for the two drivers (`SmartFilterProResetStatus
 
 Go to `Apps` → `+ Add User App` → Select **SmartFilterPro Thermostat Bridge**.
 
-#### 3. Fill Out App Configuration
+#### 3. Enable OAuth (manual installs only)
 
-You'll be prompted to configure the app:
+Hubitat Package Manager does this for you. For a manual install, open the app under `Apps Code`, click **OAuth**, then **Enable OAuth in App**, and **Update**. The sign-in below needs it: SmartFilterPro sends you back to the app through Hubitat's cloud.
 
-<img width="2460" height="1312" alt="image" src="https://github.com/user-attachments/assets/b502f6f0-0014-4af6-bca5-c67944b9ad95" />
+#### 4. Sign in and choose your thermostat
 
+1. **Select Thermostat**: choose the Hubitat-connected thermostat to track.
+2. Under **Account Link**, tap **Sign in with SmartFilterPro**. A browser tab opens smartfilterpro.com.
+3. Sign in the way you normally do in the SmartFilterPro app (Apple, Google or email), then tap **Allow**.
+4. When the tab says **Signed in to SmartFilterPro**, close it and go back to the app page.
+5. If your account has more than one thermostat, tap **Choose Thermostat** and pick the one this hub controls.
+6. Click **Done**.
 
-Required fields:
-- **Select Thermostat**: Choose your Hubitat-connected thermostat
-- **User ID**: Your Bubble app user ID
-- **Thermostat ID**: Unique identifier for this thermostat
-- **Bubble API Endpoint**: e.g. `https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/hubitat`
+The sign-in link is good for 15 minutes; if it expires, tap the button again.
 
-Other optional fields:
-- Enable debug logging for verbose logging
-- Session statistics and cleanup control
+**Email and password (older accounts):** *Use email and password instead* still works for accounts that have a SmartFilterPro password. Accounts created with Apple or Google don't have one, so use the button above.
+
+Other options:
+- **Use Test Environment**: testers only (see above)
+- **Enable Debug Logging**: verbose logs
+- **Create Status Device / Reset Button**: optional child devices showing filter health and resetting filter tracking
 
 ---
 
-#### 4. Optimize Ecobee Polling (If Applicable)
+#### 5. Optimize Ecobee Polling (If Applicable)
 
 If you’re using the **Ecobee Integration**, you may need to reduce its poll rate to ensure runtime is tracked with high fidelity.
 

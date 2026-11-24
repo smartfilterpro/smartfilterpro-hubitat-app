@@ -1,11 +1,11 @@
 {
   "packageName": "SmartFilterPro Thermostat Bridge",
   "author": "Eric Hanfman",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-11-03",
-  "releaseNotes": "Sign-in status you can trust: when SmartFilterPro stops accepting the hub's sign-in, the app page now says 'Sign-in expired' with the date instead of 'Linked', your notification devices get one alert, and the hub retries every 15 minutes instead of on every event. Runtime keeps queuing and is sent as soon as you sign in again (or the problem clears on SmartFilterPro's side). The update-notification devices now also receive this alert.",
-  "betaVersion": "1.0.10",
+  "dateReleased": "2026-11-24",
+  "releaseNotes": "Sign in with SmartFilterPro: link the hub with the same account you use in the SmartFilterPro app, including accounts created with Apple or Google. Tap Sign in with SmartFilterPro, sign in on smartfilterpro.com, and the hub is linked. Email and password sign-in still works for now. If your account has several thermostats, the app page now asks you to choose one after signing in.",
+  "betaVersion": "1.0.11",
   "communityLink": "",
   "gitHubUrl": "https://github.com/smartfilterpro/smartfilterpro-hubitat-app",
   "apps": [
@@ -13,10 +13,10 @@
       "id": "5a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
       "name": "SmartFilterPro Thermostat Bridge (8-State)",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.10/SmartFilterProHubitatApp.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.11/SmartFilterProHubitatApp.groovy",
       "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProHubitatApp.groovy",
       "required": true,
-      "oauth": false,
+      "oauth": true,
       "primary": true
     }
   ],
@@ -25,7 +25,7 @@
       "id": "6b2c3d4e-5f6a-7b8c-9d0e-1f2a3b4c5d6e",
       "name": "SmartFilterPro Status Sensor",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.10/SmartFilterProResetStatus.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.11/SmartFilterProResetStatus.groovy",
       "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProResetStatus.groovy",
       "required": false
     },
@@ -33,7 +33,7 @@
       "id": "7c3d4e5f-6a7b-8c9d-0e1f-2a3b4c5d6e7f",
       "name": "SmartFilterPro Reset Button",
       "namespace": "smartfilterpro",
-      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.10/SmartFilterProResetButton.groovy",
+      "location": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/v1.0.11/SmartFilterProResetButton.groovy",
       "betaLocation": "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/dev/SmartFilterProResetButton.groovy",
       "required": false
     }
