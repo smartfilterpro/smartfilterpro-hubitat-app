@@ -197,6 +197,59 @@ test("the email + password sign-in is gone, and a saved email or password is rem
     check(h.stateStore.sfpAccessToken == "access-token-test", "an existing link is kept")
 }
 
+println "\n(d) choosing the SmartFilterPro thermostat"
+def hrefs = { List page -> page.findAll { it.href }.collect { it.href } }
+def text = { List page -> page.findAll { it.paragraph }.collect { it.paragraph }.join(" | ") }
+def linked = { HubitatHarness h, Map choices, String chosen ->
+    h.install(t("2026-11-25 09:00:00"))
+    h.stateStore.sfpHvacChoices = choices
+    h.stateStore.sfpHvacId = chosen
+    h.stateStore.sfpHvacName = chosen ? choices[chosen] : null
+}
+
+test("with several thermostats, Switch Thermostat stays available after one is chosen") {
+    def h = harness()
+    linked(h, ["hv-1": "Upstairs", "hv-2": "Downstairs"], "hv-1")
+    List main = h.showPage("mainPage")
+    check(hrefs(main).contains("Switch Thermostat"), "main page offers Switch Thermostat: ${hrefs(main)}")
+    check(text(main).contains("SmartFilterPro thermostat: Upstairs"), text(main))
+    check(hrefs(h.showPage("linkPage")).contains("Switch Thermostat"), "re-link page offers it too")
+}
+
+test("picking a thermostat saves it straight away (no Save step), and it can be changed again") {
+    def h = harness()
+    linked(h, ["hv-1": "Upstairs", "hv-2": "Downstairs"], null)
+    check(hrefs(h.showPage("mainPage")).contains("Choose Thermostat"), "Choose Thermostat when none is chosen")
+    List sel = h.showPage("selectHvacPage")
+    Map picker = sel.find { it.input == "chosenHvac" }
+    check(picker?.options == ["hv-1": "Upstairs", "hv-2": "Downstairs"] && picker.submitOnChange, "picker lists the account's thermostats: ${picker}")
+    check(!sel.any { it.href }, "no separate Save Selection link")
+    h.settings.chosenHvac = "hv-2"
+    h.showPage("selectHvacPage")
+    check(h.stateStore.sfpHvacId == "hv-2" && h.stateStore.sfpHvacName == "Downstairs", "saved on pick: ${h.stateStore.sfpHvacId}")
+    h.settings.chosenHvac = "hv-1"
+    h.showPage("selectHvacPage")
+    check(h.stateStore.sfpHvacId == "hv-1" && h.stateStore.sfpHvacName == "Upstairs", "switched back")
+    h.settings.chosenHvac = "someone-elses"
+    h.showPage("selectHvacPage")
+    check(h.stateStore.sfpHvacId == "hv-1", "an id that isn't on the account is ignored")
+}
+
+test("an account with no Hubitat thermostat is told what to do") {
+    def h = harness()
+    linked(h, [:], null)
+    List main = h.showPage("mainPage")
+    check(text(main).contains("no Hubitat thermostat yet"), text(main))
+    check(hrefs(main).contains("Sign in with SmartFilterPro"), "offers to sign in again after adding one")
+}
+
+test("the Hubitat device setting is labelled as the device on this hub") {
+    def h = harness()
+    linked(h, ["hv-1": "Upstairs"], "hv-1")
+    Map dev = h.showPage("mainPage").find { it.input == "thermostat" }
+    check(dev?.title == "Thermostat device on this hub", "${dev?.title}")
+}
+
 println "\n${passed} passed, ${failures.size()} failed"
 if (failures) {
     failures.each { println "  - ${it}" }
