@@ -60,11 +60,11 @@ Hubitat Package Manager does this for you. For a manual install, open the app un
 
 #### 4. Sign in and choose your thermostat
 
-1. **Select Thermostat**: choose the Hubitat-connected thermostat to track.
+1. **Thermostat device on this hub**: choose the Hubitat-connected thermostat to track.
 2. Under **Account Link**, tap **Sign in with SmartFilterPro**. A browser tab opens smartfilterpro.com.
 3. Sign in the way you normally do in the SmartFilterPro app (Apple, Google or email), then tap **Allow**.
 4. When the tab says **Signed in to SmartFilterPro**, close it and go back to the app page.
-5. If your account has more than one thermostat, tap **Choose Thermostat** and pick the one this hub controls.
+5. If your account has more than one Hubitat thermostat, tap **Choose Thermostat** and pick the one this hub controls. It's saved as soon as you pick it, and **Switch Thermostat** stays on the app page if you want to change it later. If the app says your account has no Hubitat thermostat yet, add one in the SmartFilterPro app first, then tap **Sign in with SmartFilterPro** again.
 6. Click **Done**.
 
 The sign-in link is good for 15 minutes; if it expires, tap the button again.
