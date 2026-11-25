@@ -32,7 +32,7 @@ import groovy.transform.Field
 // APP_VERSION must equal "version" in packageManifest.json (and
 // DRIVER_VERSION in both drivers). scripts/check_manifest.py enforces it in
 // CI; the release workflow tags main as v<version> once they agree.
-@Field static final String  APP_VERSION = "1.0.12"
+@Field static final String  APP_VERSION = "1.0.13"
 @Field static final String  VERSION_CHECK_URL = "https://raw.githubusercontent.com/smartfilterpro/smartfilterpro-hubitat-app/main/packageManifest.json"
 
 // "Sign in with SmartFilterPro" (OAuth authorization code + PKCE). The hub
@@ -132,9 +132,11 @@ def mainPage() {
             }
         }
 
-        section("Hubitat Thermostat (optional)") {
+        section("Hubitat Thermostat Device") {
             input "thermostat", "capability.thermostat",
-                  title: "Select Thermostat (optional)", required: false, submitOnChange: true
+                  title: "Thermostat device on this hub",
+                  description: "The thermostat this app reads heating, cooling and fan activity from",
+                  required: false, submitOnChange: true
         }
 
         section("Account Link") {
@@ -147,14 +149,19 @@ def mainPage() {
                 _signInHref("Sign In Again")
                 if (state.lastLoginError) paragraph "Last attempt: ${state.lastLoginError}"
             } else if (state.sfpAccessToken && state.sfpUserId) {
-                String hvName = state.sfpHvacName ?: "(not selected)"
-                paragraph "Linked ✅ Thermostat: ${hvName}"
-                if (_needsHvacChoice()) {
-                    href "selectHvacPage", title: "Choose Thermostat",
-                         description: "Your account has ${(state.sfpHvacChoices as Map).size()} thermostats. Pick the one this hub controls."
+                Map choices = (state.sfpHvacChoices instanceof Map) ? (state.sfpHvacChoices as Map) : [:]
+                if (choices.isEmpty() && !state.sfpHvacId) {
+                    paragraph "Linked ✅ but your SmartFilterPro account has no Hubitat thermostat yet. Add your Hubitat thermostat in the SmartFilterPro app, then tap Sign in with SmartFilterPro again."
+                    _signInHref("Sign in with SmartFilterPro")
+                } else {
+                    paragraph "Linked ✅ SmartFilterPro thermostat: ${state.sfpHvacName ?: '(not selected)'}"
+                    if (choices.size() > 1) {
+                        href "selectHvacPage", title: (state.sfpHvacId ? "Switch Thermostat" : "Choose Thermostat"),
+                             description: "Your account has ${choices.size()} Hubitat thermostats. Pick the one this hub controls."
+                    }
                 }
-                href "linkPage", title: "Re-link / Switch HVAC",
-                     description: "Sign in again or choose a different HVAC"
+                href "linkPage", title: "Re-link",
+                     description: "Sign in again (also refreshes your thermostat list)"
             } else {
                 paragraph "Sign in with the account you use in the SmartFilterPro app. Apple, Google and email sign-ins all work."
                 _signInHref("Sign in with SmartFilterPro")
@@ -224,38 +231,41 @@ def linkPage() {
             section("Last Error") { paragraph "${state.lastLoginError}" }
         }
 
-        // Show HVAC selection if multiple thermostats and none selected yet
-        try {
-            def choices = state.sfpHvacChoices
-            def hvacId = state.sfpHvacId
-            if (_needsHvacChoice()) {
-                section("Select Thermostat") {
-                    href "selectHvacPage", title: "Select HVAC",
-                         description: "Multiple thermostats found (${choices.size()}). Pick one."
-                }
+        Map choices = (state.sfpHvacChoices instanceof Map) ? (state.sfpHvacChoices as Map) : [:]
+        if (choices.size() > 1) {
+            section("SmartFilterPro Thermostat") {
+                href "selectHvacPage", title: (state.sfpHvacId ? "Switch Thermostat" : "Choose Thermostat"),
+                     description: "Current: ${state.sfpHvacName ?: '(not selected)'} — ${choices.size()} Hubitat thermostats on your account"
             }
-        } catch (Exception e) {
-            log.error "Error rendering HVAC selection: ${e.message}"
-            section("Error") { paragraph "Error loading HVAC choices. Please re-authenticate." }
         }
     }
 }
 
 def selectHvacPage() {
-    dynamicPage(name: "selectHvacPage", title: "Select HVAC", install: false, uninstall: false) {
-        section("Choose Thermostat") {
-            Map opts = (state.sfpHvacChoices ?: [:])
-            input "chosenHvac", "enum", title: "Thermostat", required: true,
-                  options: opts, submitOnChange: true
-            if (settings.chosenHvac) {
-                String id = settings.chosenHvac.toString()
-                paragraph "Selected: ${opts[id] ?: id}"
-                href "chooseHvac", title: "Save Selection",
-                     style: "external",
-                     url: "${appEndpointBase()}/chooseHvac?access_token=${getOrCreateAppToken()}&id=${URLEncoder.encode(id,'UTF-8')}"
+    Map opts = (state.sfpHvacChoices instanceof Map) ? (state.sfpHvacChoices as Map) : [:]
+    // The pick is saved as soon as it is made (submitOnChange re-runs this
+    // page), so there is no separate save step and it can be changed later.
+    _saveHvacChoice(settings.chosenHvac?.toString(), opts)
+    dynamicPage(name: "selectHvacPage", title: "SmartFilterPro Thermostat", install: false, uninstall: false) {
+        section("Which SmartFilterPro thermostat does this hub control?") {
+            if (opts.isEmpty()) {
+                paragraph "No Hubitat thermostats were returned for your account. Add one in the SmartFilterPro app, then sign in again."
+            } else {
+                input "chosenHvac", "enum", title: "Thermostat", required: false,
+                      options: opts, defaultValue: state.sfpHvacId, submitOnChange: true
+                paragraph(state.sfpHvacId ? "Saved ✅ ${state.sfpHvacName ?: state.sfpHvacId}. Runtime from this hub is recorded for it." : "Pick one to start recording runtime.")
             }
         }
     }
+}
+
+/** Store the picked thermostat if it is one of the account's. */
+private void _saveHvacChoice(String id, Map opts) {
+    if (!id || !opts.containsKey(id) || id == state.sfpHvacId?.toString()) return
+    String before = state.sfpHvacName ?: state.sfpHvacId
+    state.sfpHvacId = id
+    state.sfpHvacName = opts[id]?.toString()
+    log.info "SmartFilterPro thermostat ${before ? "switched from ${before} " : ""}set to ${state.sfpHvacName}"
 }
 
 def statusPage() {
@@ -319,19 +329,12 @@ def statusPage() {
 
 mappings {
     path("/oauth/callback") { action: [ GET: "oauthCallback" ] }
-    path("/chooseHvac") { action: [ GET: "cloudChooseHvac" ] }
 }
 
 /* ============================== UTILITIES ============================== */
 
 private String hubUidSafe() {
     try { return getHubUID() } catch (e) { return location?.hubs?.first()?.id }
-}
-private String appEndpointBase() {
-    String base = getApiServerUrl() ?: ""
-    if (base.startsWith("https://cloud.hubitat.com"))
-        return "https://cloud.hubitat.com/api/${hubUidSafe()}/apps/${app.id}"
-    return "${base}/apps/api/${app.id}"
 }
 private String getOrCreateAppToken() {
     if (!state.appAccessToken) { createAccessToken(); state.appAccessToken = state.accessToken }
@@ -492,15 +495,6 @@ def debugOnlineStatus() {
 
 /* ============================== LOGIN / HVAC ============================== */
 
-def cloudChooseHvac() {
-    def id = params?.id?.toString()
-    if (id) {
-        state.sfpHvacId = URLDecoder.decode(id, "UTF-8")
-        state.sfpHvacName = (state.sfpHvacChoices ?: [:])[state.sfpHvacId]
-    }
-    _html("Saved HVAC. Close this tab and return.")
-}
-
 /* ------------------------- Sign in with SmartFilterPro ------------------------- */
 
 /** External link that starts "Sign in with SmartFilterPro" in a browser tab. */
@@ -599,7 +593,9 @@ def oauthCallback() {
         }
 
         _applySignIn(body, "Sign in with SmartFilterPro")
-        String next = _needsHvacChoice() ? " Then choose which thermostat this hub controls." : ""
+        Map got = (state.sfpHvacChoices instanceof Map) ? (state.sfpHvacChoices as Map) : [:]
+        String next = got.isEmpty() ? " Your account has no Hubitat thermostat yet: add one in the SmartFilterPro app, then sign in again." :
+                      _needsHvacChoice() ? " Then choose which thermostat this hub controls." : ""
         _html("Signed in to SmartFilterPro. Close this tab and return to the Hubitat app.${next}")
     } catch (e) {
         log.error "Sign in with SmartFilterPro failed: ${e.class.simpleName}: ${e.message}"
@@ -640,6 +636,11 @@ private void _applySignIn(Map body, String how) {
     if (choices && state.sfpHvacId && !choices.containsKey(state.sfpHvacId.toString())) {
         state.sfpHvacId = null
         state.sfpHvacName = null
+        app.removeSetting("chosenHvac")
+    }
+    // Keep the saved name in step with what SmartFilterPro calls it now.
+    if (state.sfpHvacId && choices.containsKey(state.sfpHvacId.toString())) {
+        state.sfpHvacName = choices[state.sfpHvacId.toString()]
     }
     if (choices.size() == 1) {
         state.sfpHvacId = choices.keySet().first()

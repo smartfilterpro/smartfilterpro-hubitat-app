@@ -64,6 +64,11 @@ class HubitatHarness {
     Closure hubTokenAnswer = null
     // Pages the app rendered from its web endpoints (render(...)).
     List rendered = []
+    // The last settings page rendered (dynamicPage), item by item.
+    List page = []
+
+    /** Render a settings page (e.g. "mainPage") and return what it showed. */
+    List showPage(String name) { exec { app."${name}"() }; return page }
 
     HubitatHarness(String appPath) {
         binding = new Binding()
@@ -313,8 +318,16 @@ abstract class HubitatAppScript extends Script {
     String getApiServerUrl() { "https://cloud.hubitat.com" }
     void createAccessToken() { binding.getVariable("state").accessToken = "app-token-1" }
     def render(Map m) { h.rendered << m; return m }
-    // Page DSL (only reached when a test renders a page)
-    void href(Map m) { h.rendered << [href: m] }
+    // Page DSL: tests render a page and read what it showed from h.page.
+    def dynamicPage(Map m, Closure c) { h.page = []; c.call(); return h.page }
+    void section(String title, Closure c) { h.page << [section: title]; c.call() }
+    void section(Closure c) { c.call() }
+    void paragraph(String text) { h.page << [paragraph: text] }
+    // Groovy passes named arguments first: input "x", "enum", title: ... -> input(Map, String, String)
+    void input(Map opts, String name, String type) { h.page << ([input: name, type: type] + opts) }
+    void input(String name, String type) { h.page << [input: name, type: type] }
+    void href(Map m) { h.page << [href: m.title, opts: m] }
+    void href(Map m, String pageName) { h.page << [href: m.title, page: pageName, opts: m] }
 }
 
 /** atomicState: immediate writes; reads and writes are JSON copies. */
